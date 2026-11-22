@@ -102,7 +102,7 @@ struct PluginListView: View {
             do {
                 try host.importPlugin(from: url)
             } catch {
-                presentAlert(message(for: error))
+                presentAlert(message: message(for: error))
             }
         case .failure(let error):
             presentAlert(message: "选择文件失败：\(error.localizedDescription)")
@@ -115,7 +115,7 @@ struct PluginListView: View {
             do {
                 try host.deletePlugin(plugin.id)
             } catch {
-                presentAlert(message(for: error))
+                presentAlert(message: message(for: error))
             }
         }
     }
@@ -174,13 +174,6 @@ private struct PluginRow: View {
             }
         }
         .padding(.vertical, 2)
-    }
-
-    private var enabledBinding: Binding<Bool> {
-        Binding(
-            get: { plugin.enabled },
-            set: { host.setEnabled(plugin.id, $0) }
-        )
     }
 
     private var detailText: String {
