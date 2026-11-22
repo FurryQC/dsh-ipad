@@ -1,17 +1,21 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import PhotosUI
 
 // MARK: - 悬浮面板
 
 /// 所有面板都用这一套：毛玻璃底 + 细描边 + 投影，四周留白，不贴着屏幕边。
+/// 底衬的不透明度用 `@AppStorage` 读同一个键，跟设置页滑杆实时联动（壁纸想露多少由用户定）。
 private struct FloatingPanel: ViewModifier {
     var radius: CGFloat = 26
+    @AppStorage("dsh.cardOpacity") private var cardOpacity: Double = 0.72
 
     func body(content: Content) -> some View {
         content
             .background(
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
                     .fill(.ultraThinMaterial)
+                    .opacity(cardOpacity)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: radius, style: .continuous)
@@ -217,6 +221,7 @@ struct ChatCard: View {
     @State private var showPlugins = false
     @State private var showWallpaper = false
     @State private var draft = ""
+    @State private var showAttachPanel = false
     /// 用户自己往上翻时停掉自动跟随；新消息、重新发送、点「回到底部」再打开。
     @State private var autoScroll = true
 
@@ -258,6 +263,52 @@ struct ChatCard: View {
                     }
             }
         }
+        .sheet(isPresented: $showAttachPanel) {
+            AttachmentPanel()
+                .environmentObject(model)
+        }
+        // 长按用户消息点「修改」：把原文塞回输入框。
+        .onChange(of: model.draftInjection) { value in
+            guard let value else { return }
+            draft = value
+            model.draftInjection = nil
+        }
+        .overlay(alignment: .bottom) {
+            if let toast = model.toast {
+                Text(toast)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Capsule().fill(.ultraThinMaterial))
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+                    .padding(.bottom, 92)
+                    .transition(.opacity)
+            }
+        }
+        .onChange(of: model.toast) { value in
+            guard value != nil else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                if model.toast == value { model.toast = nil }
+            }
+        }
+    }
+
+    /// 已选附件：横排缩略图，右上角红叉单独移除。
+    private var attachmentTray: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(model.pendingAttachments) { ref in
+                    AttachmentThumb(ref: ref) {
+                        AttachmentStore.shared.delete(ref)
+                        model.pendingAttachments.removeAll { $0.id == ref.id }
+                    }
+                }
+            }
+            .padding(.horizontal, 2)
+            .padding(.vertical, 2)
+        }
+        .frame(height: 66)
     }
 
     /// 对话模式不加载工具，这里给一条可点的提示，避免用户以为工具坏了。
@@ -441,6 +492,46 @@ struct ChatCard: View {
 
     // MARK: 消息
 
+    /// 把一轮任务的过程折成一行：带 tool_calls 的 assistant 消息 + 紧跟的 tool 结果合成一组。
+    private var groupedRows: [MessageRowGroup] {
+        var rows: [MessageRowGroup] = []
+        var bucket: [ChatItem] = []
+        var bucketID: UUID?
+
+        func flush() {
+            if let id = bucketID, !bucket.isEmpty {
+                rows.append(.process(id, bucket))
+            }
+            bucket = []
+            bucketID = nil
+        }
+
+        for item in model.currentItems {
+            let isProcess = item.role == .tool || !item.toolCalls.isEmpty
+            if isProcess {
+                if bucketID == nil { bucketID = UUID() }
+                bucket.append(item)
+            } else {
+                flush()
+                rows.append(.single(item))
+            }
+        }
+        flush()
+        return rows
+    }
+
+    private var lastProcessID: UUID? {
+        for row in groupedRows.reversed() {
+            if case .process(let id, _) = row { return id }
+        }
+        return nil
+    }
+
+    private func seconds(for row: MessageRowGroup) -> Double? {
+        guard case .process(let id, _) = row, id == lastProcessID else { return nil }
+        return model.currentSession?.lastRunSeconds
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -448,8 +539,16 @@ struct ChatCard: View {
                     if model.currentItems.isEmpty {
                         emptyHint
                     }
-                    ForEach(model.currentItems) { item in
-                        MessageRow(item: item).id(item.id)
+                    ForEach(groupedRows) { row in
+                        switch row {
+                        case .single(let item):
+                            MessageRow(item: item).id(item.id)
+                        case .process(let id, let items):
+                            ProcessGroup(items: items,
+                                         seconds: seconds(for: row),
+                                         isRunning: model.isRunning && id == lastProcessID)
+                                .id(id)
+                        }
                     }
                     if model.isRunning && !model.reasoningPreview.isEmpty {
                         ReasoningBubble(text: model.reasoningPreview, streaming: true)
@@ -531,6 +630,9 @@ struct ChatCard: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
+            if !model.pendingAttachments.isEmpty {
+                attachmentTray
+            }
             ZStack(alignment: .topLeading) {
                 if draft.isEmpty {
                     Text(mode == .chat ? "说点什么…" : "要它做什么…")
@@ -548,6 +650,16 @@ struct ChatCard: View {
                     .padding(.vertical, 1)
             }
             HStack(spacing: 8) {
+                Button {
+                    showAttachPanel = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Theme.textPrimary)
+                        .frame(width: 28, height: 28)
+                        .background(Circle().fill(Color.white.opacity(0.12)))
+                }
+                .disabled(model.isRunning)
                 if model.isRunning {
                     HStack(spacing: 5) {
                         Image(systemName: "bolt.fill").font(.system(size: 9, weight: .semibold))
@@ -595,41 +707,209 @@ struct ChatCard: View {
 
 struct MessageRow: View {
     let item: ChatItem
+    @EnvironmentObject private var model: AppModel
+    @State private var shareItems: [Any]?
 
     var body: some View {
         switch item.role {
         case .user:
-            HStack {
-                Spacer(minLength: 80)
-                Text(item.text)
-                    .font(.system(size: 15))
-                    .foregroundColor(Theme.textPrimary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .fill(Theme.accentSoft)
-                    )
-            }
+            userRow
         case .assistant:
-            VStack(alignment: .leading, spacing: 8) {
-                if let reasoning = item.reasoning, !reasoning.isEmpty {
-                    ReasoningBubble(text: reasoning, streaming: false)
-                }
-                if !item.text.isEmpty {
-                    AssistantBubble(text: item.text, streaming: false)
-                } else if item.toolCalls.isEmpty && item.isError {
-                    Text("（没有输出）")
-                        .font(.system(size: 13))
-                        .foregroundColor(Theme.textTertiary)
-                }
-                ForEach(item.toolCalls) { call in
-                    ToolChip(call: call)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            assistantRow
         case .tool:
             ToolCard(item: item)
+        }
+    }
+
+    private var userRow: some View {
+        HStack {
+            Spacer(minLength: 80)
+            VStack(alignment: .trailing, spacing: 6) {
+                if !item.attachments.isEmpty {
+                    AttachmentStrip(refs: item.attachments)
+                }
+                if !item.text.isEmpty {
+                    Text(item.text)
+                        .font(.system(size: 15))
+                        .foregroundColor(Theme.textPrimary)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Theme.accentSoft)
+            )
+            .contextMenu {
+                Button {
+                    if let text = model.takeBackPrompt(item.id) {
+                        model.draftInjection = text
+                    }
+                } label: {
+                    Label("修改", systemImage: "pencil")
+                }
+                Button {
+                    MessageActions.copyToPasteboard(item.text)
+                    model.toast = "已复制"
+                } label: {
+                    Label("复制", systemImage: "doc.on.doc")
+                }
+            }
+        }
+    }
+
+    private var assistantRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let reasoning = item.reasoning, !reasoning.isEmpty {
+                ReasoningBubble(text: reasoning, streaming: false)
+            }
+            if !item.text.isEmpty {
+                AssistantBubble(text: item.text, streaming: false)
+            } else if item.toolCalls.isEmpty && item.isError {
+                Text("（没有输出）")
+                    .font(.system(size: 13))
+                    .foregroundColor(Theme.textTertiary)
+            }
+            ForEach(item.toolCalls) { call in
+                ToolChip(call: call)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contextMenu {
+            Button {
+                MessageActions.copyToPasteboard(item.text)
+                model.toast = "已复制"
+            } label: {
+                Label("复制", systemImage: "doc.on.doc")
+            }
+            Button {
+                model.regenerateLastReply()
+            } label: {
+                Label("重新生成", systemImage: "arrow.clockwise")
+            }
+            Button {
+                model.toast = "已记录「喜欢」"
+            } label: {
+                Label("喜欢", systemImage: "hand.thumbsup")
+            }
+            Button {
+                model.toast = "已记录「不喜欢」"
+            } label: {
+                Label("不喜欢", systemImage: "hand.thumbsdown")
+            }
+            Button {
+                SpeechPlayer.shared.toggle(id: item.id, text: item.text)
+            } label: {
+                Label(SpeechPlayer.shared.speakingItemID == item.id ? "停止朗读" : "朗读", systemImage: "speaker.wave.2")
+            }
+            Button {
+                shareItems = [item.text]
+            } label: {
+                Label("分享", systemImage: "square.and.arrow.up")
+            }
+        }
+        .sheet(isPresented: Binding(get: { shareItems != nil }, set: { if !$0 { shareItems = nil } })) {
+            ShareSheet(items: shareItems ?? [])
+        }
+    }
+}
+
+/// 一条用户消息里的图片/文件小缩略图。手机上不放原尺寸，避免一张图占满一屏。
+struct AttachmentStrip: View {
+    let refs: [AttachmentRef]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(refs) { ref in
+                if ref.kind == .image, let image = AttachmentStore.shared.image(for: ref) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 84, height: 84)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                } else {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.fill").font(.system(size: 10))
+                        Text(ref.fileName).font(.system(size: 10)).lineLimit(1)
+                    }
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white.opacity(0.08)))
+                }
+            }
+        }
+    }
+}
+
+/// 一轮任务里的「过程」（思考 + 工具调用）折成一行，默认收起；正在跑的这一轮默认展开。
+struct ProcessGroup: View {
+    let items: [ChatItem]
+    let seconds: Double?
+    let isRunning: Bool
+    @State private var expanded: Bool
+
+    init(items: [ChatItem], seconds: Double?, isRunning: Bool) {
+        self.items = items
+        self.seconds = seconds
+        self.isRunning = isRunning
+        _expanded = State(initialValue: isRunning)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: isRunning ? "ellipsis" : "checkmark.circle")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(headerText)
+                        .font(.system(size: 12, weight: .medium))
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(Theme.textTertiary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.05)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if expanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(items) { item in
+                        MessageRow(item: item)
+                    }
+                }
+                .padding(.leading, 4)
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private var headerText: String {
+        if isRunning { return "正在处理…" }
+        guard let seconds else { return "已完成" }
+        let total = Int(seconds.rounded())
+        if total < 60 { return "已完成，用时 \(max(total, 1)) 秒" }
+        return "已完成，用时 \(total / 60) 分 \(total % 60) 秒"
+    }
+}
+
+/// 消息列表的一行：要么是一条普通消息，要么是一折起来的「过程」。
+enum MessageRowGroup: Identifiable {
+    case single(ChatItem)
+    case process(UUID, [ChatItem])
+
+    var id: UUID {
+        switch self {
+        case .single(let item):
+            return item.id
+        case .process(let id, _):
+            return id
         }
     }
 }
@@ -696,7 +976,195 @@ struct ReasoningBubble: View {
     }
 }
 
-/// 助手要调用的工具先亮一张小条，执行结果在下一行 ToolCard 里。
+// MARK: - 附件
+
+/// 输入框上方的一枚已选附件：图片显示缩略图，其它文件显示名字，右上角红叉可撤销。
+struct AttachmentThumb: View {
+    let ref: AttachmentRef
+    let onRemove: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            if ref.kind == .image, let image = AttachmentStore.shared.image(for: ref) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 60, height: 60)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            } else {
+                VStack(spacing: 4) {
+                    Image(systemName: "doc.fill").font(.system(size: 16))
+                    Text(ref.fileName).font(.system(size: 9)).lineLimit(1)
+                }
+                .foregroundColor(Theme.textSecondary)
+                .frame(width: 60, height: 60)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.08)))
+            }
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 15))
+                    .foregroundColor(Theme.danger)
+                    .background(Circle().fill(Color.black.opacity(0.55)))
+            }
+            .offset(x: 5, y: -5)
+        }
+        .frame(width: 64, height: 64)
+    }
+}
+
+/// 「+」打出来的面板：相册 / 拍照 / 文件。图片直接进 Messages 的 image 块，文件复制进工作目录。
+struct AttachmentPanel: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var showCamera = false
+    @State private var showFiles = false
+    @State private var errorText: String?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Capsule()
+                .fill(Color.white.opacity(0.18))
+                .frame(width: 38, height: 4)
+                .padding(.top, 10)
+            HStack(spacing: 10) {
+                PhotosPicker(selection: $pickerItems, maxSelectionCount: 6, matching: .images, photoLibrary: .shared()) {
+                    panelButton("相册", systemImage: "photo.on.rectangle")
+                }
+                Button {
+                    showCamera = true
+                } label: {
+                    panelButton("拍照", systemImage: "camera")
+                }
+                Button {
+                    showFiles = true
+                } label: {
+                    panelButton("文件", systemImage: "paperclip")
+                }
+            }
+            .padding(.horizontal, 18)
+            Text("图片会先缩到 2048 长边再传（flash 模型能直接看图）；文件会复制进工作目录，agent 能用 read_file 读。")
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textTertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 30)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Theme.bg.ignoresSafeArea())
+        .onChange(of: pickerItems) { items in
+            guard !items.isEmpty else { return }
+            Task {
+                await ingestPhotos(items)
+                pickerItems = []
+            }
+        }
+        .fullScreenCover(isPresented: $showCamera) {
+            CameraPicker { image in
+                showCamera = false
+                if let image, let data = image.jpegData(compressionQuality: 0.9) {
+                    ingest(data: data, fileName: "camera.jpg", mimeType: "image/jpeg", kind: .image)
+                }
+            }
+            .ignoresSafeArea()
+        }
+        .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            switch result {
+            case .success(let urls):
+                for url in urls { ingestFile(url) }
+                if !urls.isEmpty { dismiss() }
+            case .failure(let error):
+                errorText = "选文件失败：\(error.localizedDescription)"
+            }
+        }
+        .alert("附件没加上", isPresented: Binding(get: { errorText != nil }, set: { if !$0 { errorText = nil } })) {
+            Button("知道了", role: .cancel) { errorText = nil }
+        } message: {
+            Text(errorText ?? "")
+        }
+    }
+
+    private func panelButton(_ title: String, systemImage: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: systemImage).font(.system(size: 20, weight: .medium))
+            Text(title).font(.system(size: 13, weight: .medium))
+        }
+        .foregroundColor(Theme.textPrimary)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 16)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.white.opacity(0.09)))
+    }
+
+    private func ingestPhotos(_ items: [PhotosPickerItem]) async {
+        for item in items {
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self) else { continue }
+                ingest(data: data, fileName: "photo.jpg", mimeType: "image/jpeg", kind: .image)
+            } catch {
+                errorText = "图片读取失败：\(error.localizedDescription)"
+            }
+        }
+        if !model.pendingAttachments.isEmpty { dismiss() }
+    }
+
+    private func ingestFile(_ url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let data = try Data(contentsOf: url)
+            let type = UTType(filenameExtension: url.pathExtension)
+            let mime = type?.preferredMIMEType ?? "application/octet-stream"
+            let kind: AttachmentKind = (type?.conforms(to: .image) ?? false) ? .image : .file
+            ingest(data: data, fileName: url.lastPathComponent, mimeType: mime, kind: kind)
+        } catch {
+            errorText = "读不了这个文件：\(url.lastPathComponent)"
+        }
+    }
+
+    private func ingest(data: Data, fileName: String, mimeType: String, kind: AttachmentKind) {
+        do {
+            let ref = try AttachmentStore.shared.save(data: data, fileName: fileName, mimeType: mimeType, kind: kind)
+            model.pendingAttachments.append(ref)
+        } catch {
+            errorText = (error as? LocalizedError)?.errorDescription ?? "保存附件失败。"
+        }
+    }
+}
+
+/// 系统相机/相册的 UIKit 包装：iOS 没有 SwiftUI 原生相机入口。
+struct CameraPicker: UIViewControllerRepresentable {
+    let onFinish: (UIImage?) -> Void
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = UIImagePickerController.isSourceTypeAvailable(.camera) ? .camera : .photoLibrary
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onFinish: onFinish)
+    }
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        private let onFinish: (UIImage?) -> Void
+
+        init(onFinish: @escaping (UIImage?) -> Void) {
+            self.onFinish = onFinish
+        }
+
+        func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            onFinish(info[.originalImage] as? UIImage)
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            onFinish(nil)
+        }
+    }
+}
 struct ToolChip: View {
     let call: ToolCall
 
@@ -867,6 +1335,22 @@ struct SettingsView: View {
                     Text("运行")
                 } footer: {
                     Text("对话模式不带工具，不会弹这个提醒。")
+                }
+
+                Section {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("卡片不透明度")
+                            Spacer()
+                            Text(String(format: "%.0f%%", model.cardOpacity * 100))
+                                .foregroundColor(Theme.textSecondary)
+                        }
+                        Slider(value: $model.cardOpacity, in: 0.25...1.0)
+                    }
+                } header: {
+                    Text("外观")
+                } footer: {
+                    Text("调低能多看到一点壁纸，调高字更清楚。")
                 }
 
                 Section {

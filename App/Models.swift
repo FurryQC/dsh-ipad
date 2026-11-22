@@ -55,6 +55,8 @@ struct ChatItem: Identifiable, Codable, Hashable {
     var reasoning: String?
     /// 推理块的签名。回放历史时必须原样带回，否则服务端拒绝。
     var reasoningSignature: String?
+    /// 用户消息里带的图片/文件。图片会以 base64 图片块发给模型，文件只作说明。
+    var attachments: [AttachmentRef] = []
 }
 
 struct ChatSession: Identifiable, Codable {
@@ -63,21 +65,25 @@ struct ChatSession: Identifiable, Codable {
     var mode: SessionMode
     var items: [ChatItem]
     var updatedAt: Date
+    /// 最近一次跑完工具的耗时。结果折叠行要显示「已完成，用时 X」，不落盘就只剩转圈。
+    var lastRunSeconds: Double?
 
     init(id: UUID = UUID(),
          title: String = "新对话",
          mode: SessionMode = .chat,
          items: [ChatItem] = [],
-         updatedAt: Date = Date()) {
+         updatedAt: Date = Date(),
+         lastRunSeconds: Double? = nil) {
         self.id = id
         self.title = title
         self.mode = mode
         self.items = items
         self.updatedAt = updatedAt
+        self.lastRunSeconds = lastRunSeconds
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, mode, items, updatedAt
+        case id, title, mode, items, updatedAt, lastRunSeconds
     }
 
     /// 手写解码：旧版本会话文件里没有 mode 字段，缺了就按「工作」读回，
@@ -89,6 +95,7 @@ struct ChatSession: Identifiable, Codable {
         mode = try container.decodeIfPresent(SessionMode.self, forKey: .mode) ?? .work
         items = try container.decodeIfPresent([ChatItem].self, forKey: .items) ?? []
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+        lastRunSeconds = try container.decodeIfPresent(Double.self, forKey: .lastRunSeconds)
     }
 }
 

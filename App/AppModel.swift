@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import UIKit
 
@@ -39,6 +40,12 @@ final class AppModel: ObservableObject {
     }
     /// 只在设置页点「保存」时写钥匙串，输入过程中不落盘。
     @Published var apiKey: String
+    /// 卡片底的不透明度：用户嫌壁纸被盖住时可以自己调透。
+    @Published var cardOpacity: Double {
+        didSet { UserDefaults.standard.set(cardOpacity, forKey: Keys.cardOpacity) }
+    }
+    /// 输入框里已经选好、还没发出去的图片和文件。
+    @Published var pendingAttachments: [AttachmentRef] = []
 
     // MARK: - 运行状态
 
@@ -48,6 +55,10 @@ final class AppModel: ObservableObject {
     @Published var statusLine = ""
     @Published var errorText: String?
     @Published var showSwitchWarning = false
+    /// 长按「修改」把原文塞回输入框；ChatCard 取走后置空。
+    @Published var draftInjection: String?
+    /// 一次性小提示（复制成功之类）。
+    @Published var toast: String?
     @Published var availableModels: [ModelOption] = []
     @Published var isFetchingModels = false
 
@@ -59,6 +70,8 @@ final class AppModel: ObservableObject {
     private var warnedThisLaunch = false
     /// 被 stop 的旧任务收尾时不能改动新任务的状态。
     private var runID = UUID()
+    /// send 之后、真正开跑之前（可能中间插了个「别切走」确认框），附件得先存着。
+    private var queuedAttachments: [AttachmentRef] = []
 
     private enum Keys {
         static let baseURL = "dsh.baseURL"
@@ -66,6 +79,7 @@ final class AppModel: ObservableObject {
         static let effort = "dsh.effort"
         static let maxRounds = "dsh.maxRounds"
         static let warnBeforeRun = "dsh.warnBeforeRun"
+        static let cardOpacity = "dsh.cardOpacity"
     }
 
     // MARK: - 生命周期
@@ -78,6 +92,8 @@ final class AppModel: ObservableObject {
         let rounds = defaults.integer(forKey: Keys.maxRounds)
         maxRounds = rounds > 0 ? rounds : 24
         warnBeforeRun = defaults.object(forKey: Keys.warnBeforeRun) as? Bool ?? true
+        let opacity = defaults.object(forKey: Keys.cardOpacity) as? Double ?? 0.72
+        cardOpacity = opacity < 0.15 ? 0.72 : min(opacity, 1.0)
         apiKey = Keychain.loadAPIKey()
         let first = ChatSession(title: SessionMode.work.title, mode: .work)
         sessions = [first]
@@ -141,11 +157,34 @@ final class AppModel: ObservableObject {
         mutate(currentSessionID) { $0.items = [] }
     }
 
+    // MARK: - 消息操作（长按菜单与「修改」用）
+
+    /// 长按「修改」时把输入框填回这条消息的内容。返回 nil 表示当前不能改（正在跑）。
+    func takeBackPrompt(_ id: UUID) -> String? {
+        guard !isRunning, let session = currentSession else { return nil }
+        guard let index = session.items.firstIndex(where: { $0.id == id }) else { return nil }
+        let text = session.items[index].text
+        mutate(currentSessionID) { $0.items.removeSubrange(index...) }
+        return text
+    }
+
+    /// 「重新生成」：删掉最后一条用户消息之后的所有内容，带上同样的附件重跑。
+    func regenerateLastReply() {
+        guard !isRunning, let session = currentSession else { return }
+        guard let index = session.items.lastIndex(where: { $0.role == .user }) else { return }
+        let prompt = session.items[index].text
+        let attachments = session.items[index].attachments
+        mutate(currentSessionID) { $0.items.removeSubrange(index...) }
+        queuedAttachments = attachments
+        startRun(prompt: prompt, appendUserMessage: true)
+    }
+
     // MARK: - 发送与任务循环
 
     func send(_ prompt: String) {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isRunning else { return }
+        let attachments = pendingAttachments
+        guard !text.isEmpty || !attachments.isEmpty, !isRunning else { return }
         var problem: String?
         if apiKey.trimmingCharacters(in: .whitespaces).isEmpty {
             problem = "还没填 API key。到设置里填一个，保存后再发。"
@@ -156,6 +195,8 @@ final class AppModel: ObservableObject {
             errorText = problem
             return
         }
+        queuedAttachments = attachments
+        pendingAttachments = []
         if currentSession?.mode == .work, warnBeforeRun, !warnedThisLaunch {
             pendingPrompt = text
             showSwitchWarning = true
@@ -202,6 +243,38 @@ final class AppModel: ObservableObject {
         startRun(prompt: prompt, appendUserMessage: true)
     }
 
+    /// 把这条用户消息之后的内容全删掉，原文交回输入框让用户改完再发。
+    func takeBackPrompt(_ itemID: UUID) -> String? {
+        guard !isRunning else { return nil }
+        let sessionID = currentSessionID
+        var text: String?
+        mutate(sessionID) { session in
+            guard let index = session.items.firstIndex(where: { $0.id == itemID }) else { return }
+            text = session.items[index].text
+            session.items.removeSubrange(index..<session.items.endIndex)
+        }
+        save()
+        return text
+    }
+
+    /// 重新生成最后一条回复：砍掉最后一次问答，用同一个提问重跑。
+    func regenerateLastReply() {
+        guard !isRunning else { return }
+        let sessionID = currentSessionID
+        var prompt: String?
+        mutate(sessionID) { session in
+            guard let userIndex = session.items.lastIndex(where: { $0.role == .user }) else { return }
+            prompt = session.items[userIndex].text
+            session.items.removeSubrange((userIndex + 1)..<session.items.endIndex)
+        }
+        save()
+        guard let prompt, !prompt.isEmpty else {
+            errorText = "这条提问没有文字内容，没法重新生成。"
+            return
+        }
+        startRun(prompt: prompt, appendUserMessage: false)
+    }
+
     func handleScenePhase(_ phase: ScenePhaseValue) {
         switch phase {
         case .active:
@@ -217,7 +290,9 @@ final class AppModel: ObservableObject {
     private func startRun(prompt: String, appendUserMessage: Bool) {
         let sessionID = currentSessionID
         if appendUserMessage {
-            appendItem(ChatItem(role: .user, text: prompt), to: sessionID)
+            let attachments = queuedAttachments
+            queuedAttachments = []
+            appendItem(ChatItem(role: .user, text: prompt, attachments: attachments), to: sessionID)
         }
         errorText = nil
         isRunning = true
@@ -234,6 +309,7 @@ final class AppModel: ObservableObject {
     }
 
     private func runLoop(sessionID: UUID, runID myID: UUID) async {
+        let startedAt = Date()
         var round = 0
         var finishedNaturally = false
 
@@ -319,6 +395,8 @@ final class AppModel: ObservableObject {
         }
 
         guard runID == myID else { return }
+        let elapsed = Date().timeIntervalSince(startedAt)
+        mutate(sessionID) { $0.lastRunSeconds = elapsed }
         streamPreview = ""
         reasoningPreview = ""
         statusLine = ""
@@ -483,7 +561,25 @@ final class AppModel: ObservableObject {
             switch item.role {
             case .user:
                 flushResults()
-                appendText(role: "user", text: item.text)
+                if item.attachments.isEmpty {
+                    appendText(role: "user", text: item.text)
+                } else {
+                    var blocks: [[String: Any]] = []
+                    for ref in item.attachments {
+                        if ref.kind == .image, let data = AttachmentStore.shared.base64(for: ref) {
+                            blocks.append([
+                                "type": "image",
+                                "source": ["type": "base64", "media_type": ref.mimeType, "data": data],
+                            ])
+                            continue
+                        }
+                        blocks.append(["type": "text", "text": fileAttachmentNote(ref)])
+                    }
+                    if !item.text.isEmpty {
+                        blocks.append(["type": "text", "text": item.text])
+                    }
+                    messages.append(["role": "user", "content": blocks])
+                }
             case .assistant:
                 flushResults()
                 var blocks: [[String: Any]] = []
@@ -513,6 +609,32 @@ final class AppModel: ObservableObject {
         }
         flushResults()
         return messages
+    }
+
+    /// 文件类附件塞不进图片块，只能把「在哪儿、多大」写进文本，让模型自己用工具去读。
+    private func fileAttachmentNote(_ ref: AttachmentRef) -> String {
+        if let local = mirrorAttachment(ref) {
+            return "（用户上传了文件：\(ref.fileName)，\(ref.byteCount) 字节，已复制到工作目录 \(local)，可以用 read_file 读。）"
+        }
+        return "（用户上传了文件：\(ref.fileName)，\(ref.byteCount) 字节，但复制到工作目录失败，读不到内容。）"
+    }
+
+    /// 工具只能访问工作目录与挂载目录，所以把附件副本放进 workspace/attachments 才能被 read_file 读到。
+    private func mirrorAttachment(_ ref: AttachmentRef) -> String? {
+        guard ref.kind == .file else { return nil }
+        let manager = FileManager.default
+        let folder = Workspace.root.appendingPathComponent("attachments", isDirectory: true)
+        let target = folder.appendingPathComponent(ref.storedName)
+        do {
+            try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+            if manager.fileExists(atPath: target.path) {
+                try manager.removeItem(at: target)
+            }
+            try manager.copyItem(at: AttachmentStore.shared.url(for: ref), to: target)
+            return "attachments/" + ref.storedName
+        } catch {
+            return nil
+        }
     }
 
     private func systemPrompt(sessionID: UUID) -> String {
@@ -546,11 +668,12 @@ final class AppModel: ObservableObject {
 
         当前会话模式：「工作」模式，工具已启用，可以真的读写文件、跑工具循环。这一点以本段为准 —— 历史消息里如果提到「对话模式」「没有工具」，那是切换模式之前的旧说法，已作废。被问到「你现在是什么模式」时，回答「工作模式」。
 
-        环境限制（不要假装能绕过）：
-        - 这是 iOS App，没有 shell、没有 git、没有编译器，不能 fork 进程，也不能读写系统目录或别的 App 的私有数据。
-        - 文件路径相对工作目录（Documents/workspace），也可以用 mount:<名字>/... 访问用户在设置里授权的文件夹。
+        文件与权限：
+        - 先动手试，不要预设「没权限」。工作目录（Documents/workspace）和 mount:<名字>/... 一定能读写。
+        - 文件路径相对工作目录，也可以用 mount:<名字>/... 访问用户授权过的文件夹。
         \(mountLine)
-        - 需要计算或脚本时用 run_js；需要取网页内容时用 fetch_url。
+        - Documents 之外的沙盒路径、系统目录、别的 App 的私有目录通常会被 iOS 拒绝。真被拒绝时工具会返回「错误：…」，这时再告诉用户这个位置改不了，并建议在设置里用「添加外部文件夹」授权一个可写目录。不要拿「可能没权限」当理由提前拒绝干活。
+        - 这台设备上没有 shell、没有 git、没有编译器，也不能起子进程 —— 这不是权限问题，是根本没有这种能力：要算东西用 run_js，要取网页用 fetch_url。
 
         可用工具：list_dir / read_file / write_file / edit_file / make_dir / delete_path / move_path / copy_path / search_files / file_info / fetch_url / run_js / now。
 
