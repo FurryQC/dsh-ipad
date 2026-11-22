@@ -3,110 +3,120 @@ import ReplayKit
 import UIKit
 import UserNotifications
 
-/// 屏幕广播扩展：只做一件事 —— 按间隔把一帧 JPEG 落进 App Group 共享容器。
+/// 屏幕广播扩展。
 ///
-/// 真正的网络请求由主 App 发（主 App 有钥匙串、有会话、能发通知），
-/// 扩展里不碰 API key，也就少一处「读不到配置就整条链路静默失败」的坑。
+/// 落地的方案：**不依赖 App Group**。
+/// 重签时如果只给主 App 注入了 `group.com.dsh.qc`，扩展里
+/// `containerURL(forSecurityApplicationGroupIdentifier:)` 和共享 UserDefaults 全是 nil
+/// （b29 的弹窗已经证实），所以扩展改成：
+///   1. 启动时从主 App 的 loopback 服务（127.0.0.1:56290）取一次配置；
+///   2. 自己按间隔截帧、直接调 DeepSeek（flash + 推理关）、自己发系统通知。
+/// 全程不需要任何 entitlement。
 final class SampleHandler: RPBroadcastSampleHandler {
     private let ciContext = CIContext(options: nil)
+    private var config: WatchShared.Config?
     private var lastFrameAt = Date.distantPast
     private var frameCount = 0
-    private var writtenCount = 0
-    private var lastDiagWrite = Date.distantPast
+    private var sentCount = 0
+    private var inFlight = false
     private var announcedFirstFrame = false
-    private var announcedFirstWrite = false
+    private var announcedFirstSend = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
-        // 配置优先读容器里的文件（能读回来几条信息全写进错误弹窗，别让人猜）。
-        let loaded = WatchShared.loadConfigDetailed()
-        let config = loaded.config
-        let groupOK = WatchShared.groupAvailable
-        WatchShared.updateDiag { diag in
-            diag.groupOK = groupOK
-            diag.configEnabled = config.enabled
-            diag.frames = 0
-            diag.sent = 0
-            diag.lastError = config.enabled ? "广播已启动，等第一帧" : "扩展起来了但配置读到的是「未启用」（来源 \(loaded.source)）"
+        let outcome = WatchConfigClient.fetch()
+        switch outcome {
+        case .success(let loaded):
+            config = loaded
+            diag { d in
+                d.groupOK = WatchShared.groupAvailable
+                d.configEnabled = loaded.enabled
+                d.frames = 0
+                d.sent = 0
+                d.lastError = ""
+            }
+            Self.notifyNow("DSH 屏幕识别 · 已连上 App",
+                           "配置已取到（每 \(Int(loaded.intervalSeconds)) 秒一帧，模型 \(loaded.model)）。开始识别。")
+        case .failure(let message):
+            diag { d in
+                d.groupOK = WatchShared.groupAvailable
+                d.configEnabled = false
+                d.lastError = message
+            }
+            finishBroadcastWithError(Self.watchError(
+                "扩展已启动，但没能从 App 取到配置：\(message)。\n请回到 App 的「屏幕识别」页，确认已点过「保存配置」，再点红色圆钮开始；App 在前台时这个通道才开着。"
+            ))
+        }
+    }
+
+    override func broadcastFinished() {
+        diag { d in
+            d.frames = self.frameCount
+            d.sent = self.sentCount
+        }
+        Self.notifyNow("DSH 屏幕识别 · 已停止", "收到 \(frameCount) 帧画面，发出 \(sentCount) 次识别。")
+    }
+
+    override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
+        guard sampleBufferType == .video, let config else { return }
+        guard !inFlight else { return }
+
+        frameCount += 1
+        if frameCount == 1 && !announcedFirstFrame {
+            announcedFirstFrame = true
+            Self.notifyNow("DSH 屏幕识别 · 收到画面", "第一帧已到，开始按间隔识别。")
         }
 
-        // 这两条错误会由系统弹给用户，是「扩展到底跑没跑起来 / 能不能读到配置」最直接的证据：
-        // 弹出来说明扩展活了；连弹窗都没有说明扩展根本没被系统拉起（重签时 appex 没签好）。
-        let containerInfo = WatchShared.containerDiagnostics()
-        if !groupOK {
-            finishBroadcastWithError(Self.watchError(
-                "扩展已启动，但拿不到 App Group（group.com.dsh.qc）。扩展这边：\(containerInfo)。重签时请把 group.com.dsh.qc 同时加到 com.dsh.qc 和 com.dsh.qc.broadcast。"
-            ))
-            return
-        }
-        if !config.enabled {
-            finishBroadcastWithError(Self.watchError(
-                "扩展已启动，容器可用，但读到的配置是「未启用」。扩展读到的：\(loaded.detail)；容器：\(containerInfo)。回 App 的屏幕识别页点一次「保存配置」再试；如果这里显示来源 none 或文件不存在，说明主 App 和扩展没共享同一个容器。"
-            ))
-            return
-        }
+        let interval = max(1.0, min(5.0, config.intervalSeconds))
+        guard Date().timeIntervalSince(lastFrameAt) >= interval else { return }
+        guard let jpeg = Self.makeJPEG(from: sampleBuffer, context: ciContext) else { return }
+        lastFrameAt = Date()
+        inFlight = true
 
-        Self.notifyNow("DSH 屏幕识别 · 扩展已启动", "配置来源 \(loaded.source)；容器可用，等第一帧画面。")
+        let base64 = jpeg.base64EncodedString()
+        let snapshot = config
+        Task { [weak self] in
+            defer { self?.inFlight = false }
+            do {
+                let answer = try await WatchVision.ask(jpegBase64: base64, config: snapshot)
+                let text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { return }
+                await MainActor.run { self?.sentCount += 1 }
+                if snapshot.notify {
+                    Self.notifyNow("DSH 屏幕识别", String(text.prefix(300)))
+                }
+                if let self {
+                    self.diag { d in
+                        d.frames = self.frameCount
+                        d.sent = self.sentCount
+                        d.configEnabled = true
+                        d.lastError = ""
+                    }
+                }
+                if !(self?.announcedFirstSend ?? true) {
+                    self?.announcedFirstSend = true
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                if let self {
+                    self.diag { d in
+                        d.frames = self.frameCount
+                        d.sent = self.sentCount
+                        d.lastError = message
+                    }
+                }
+                Self.notifyNow("DSH 屏幕识别 · 这次没成", message)
+            }
+        }
+    }
+
+    /// 配置全在扩展内存里，诊断只往共享容器写（能写就写，写不进也不影响识别）。
+    private func diag(_ mutate: (inout WatchShared.Diag) -> Void) {
+        guard WatchShared.groupAvailable else { return }
+        WatchShared.updateDiag(mutate)
     }
 
     private static func watchError(_ message: String) -> NSError {
         NSError(domain: "com.dsh.qc.broadcast", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-    }
-
-    override func broadcastFinished() {
-        WatchShared.updateDiag { diag in
-            diag.lastError = "广播已停止（收到 \(diag.frames) 帧，写入 \(self.writtenCount) 帧）"
-        }
-        Self.notifyNow("DSH 屏幕识别 · 已停止", "收到 \(frameCount) 帧画面，写入共享容器 \(writtenCount) 帧。")
-    }
-
-    override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
-        guard sampleBufferType == .video else { return }
-
-        frameCount += 1
-        let config = WatchShared.loadConfigDetailed().config
-        writeDiagIfNeeded(config: config)
-
-        if frameCount == 1 && !announcedFirstFrame {
-            announcedFirstFrame = true
-            Self.notifyNow("DSH 屏幕识别 · 收到画面", "第 1 帧已到达，正在按间隔写入共享容器。")
-        }
-
-        // 配置读不到也照写：只要共享容器通着，主 App 就能拿到画面；
-        // 容器不通的话 writeFrame 返回 false，诊断里会记下来。
-        let interval = max(1.0, min(5.0, config.intervalSeconds))
-        guard Date().timeIntervalSince(lastFrameAt) >= interval else { return }
-        guard let jpeg = Self.makeJPEG(from: sampleBuffer, context: ciContext) else {
-            WatchShared.updateDiag { $0.lastError = "帧转 JPEG 失败（收到 \(self.frameCount) 帧）" }
-            return
-        }
-        lastFrameAt = Date()
-        if WatchShared.writeFrame(jpeg) {
-            writtenCount += 1
-            if !announcedFirstWrite {
-                announcedFirstWrite = true
-                Self.notifyNow("DSH 屏幕识别 · 画面已写入", "主 App 会读走它、发给模型。")
-            }
-        } else {
-            WatchShared.updateDiag { $0.lastError = "写不进共享容器 —— 重签时多半没给扩展加 App Group（group.com.dsh.qc）" }
-        }
-    }
-
-    /// 每帧都写 UserDefaults 太重，最多 2 秒写一次。
-    private func writeDiagIfNeeded(config: WatchShared.Config) {
-        let now = Date()
-        guard now.timeIntervalSince(lastDiagWrite) > 2 else { return }
-        lastDiagWrite = now
-        let framesNow = frameCount
-        let writtenNow = writtenCount
-        WatchShared.updateDiag { diag in
-            diag.groupOK = WatchShared.groupAvailable
-            diag.configEnabled = config.enabled
-            diag.frames = framesNow
-            diag.sent = writtenNow
-            if !config.enabled && diag.lastError.isEmpty {
-                diag.lastError = "配置读到的是「未启用」"
-            }
-        }
     }
 
     private static func makeJPEG(from sampleBuffer: CMSampleBuffer, context: CIContext) -> Data? {
