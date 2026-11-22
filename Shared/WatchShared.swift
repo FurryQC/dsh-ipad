@@ -39,6 +39,57 @@ enum WatchShared {
     static func save(_ config: Config) {
         guard let data = try? JSONEncoder().encode(config) else { return }
         defaults.set(data, forKey: configKey)
+        // 同一个配置再写一份普通文件：跨进程的 UserDefaults 偶尔不可靠（重签后 App Group
+        // 只给了一边时，写进偏好项的其实还落在各自的本地区，扩展读到的永远是空的）。
+        // 文件走容器路径，成不成一眼能看出来，扩展优先读它。
+        _ = saveToFile(config)
+    }
+
+    /// 共享容器里的配置文件（比 UserDefaults 更直白的跨进程通道）。
+    static var configFileURL: URL? {
+        containerURL?.appendingPathComponent("watch-config.json")
+    }
+
+    @discardableResult
+    static func saveToFile(_ config: Config) -> Bool {
+        guard let url = configFileURL,
+              let data = try? JSONEncoder().encode(config) else { return false }
+        do {
+            try data.write(to: url, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 读配置并说明来源，便于把「到底是哪一步断了」直接摆给用户看。
+    ///
+    /// - Returns: config 实际配置；source 取值为 `file` / `defaults` / `none`；
+    ///   detail 是人类可读的一句说明（含路径、字节数、解码错误）。
+    static func loadConfigDetailed() -> (config: Config, source: String, detail: String) {
+        let filePath = configFileURL?.path ?? "nil"
+        if let url = configFileURL, let data = try? Data(contentsOf: url) {
+            do {
+                let config = try JSONDecoder().decode(Config.self, from: data)
+                return (config, "file", "配置文件=\(filePath)（\(data.count) 字节，enabled=\(config.enabled)）")
+            } catch {
+                // 文件在但读不动：继续试偏好项，并把错误带出去。
+                let fallback = legacyLoad()
+                return (fallback, "defaults", "配置文件解码失败（\(error.localizedDescription)），改用偏好项；路径=\(filePath)")
+            }
+        }
+        let fallback = legacyLoad()
+        let hasKey = defaults.data(forKey: configKey) != nil
+        return (fallback, hasKey ? "defaults" : "none",
+                "共享容器里没有配置文件（路径=\(filePath)），偏好项\(hasKey ? "有" : "也没有")数据；enabled=\(fallback.enabled)")
+    }
+
+    private static func legacyLoad() -> Config {
+        guard let data = defaults.data(forKey: configKey),
+              let config = try? JSONDecoder().decode(Config.self, from: data) else {
+            return Config()
+        }
+        return config
     }
 
     static func recordResult(_ text: String) {
@@ -71,6 +122,26 @@ enum WatchShared {
 
     /// App Group 是否可用。重签时没给两个 target 都加 entitlements，这里就是 false。
     static var groupAvailable: Bool { UserDefaults(suiteName: suiteName) != nil }
+
+    /// 主 App 与扩展各自跑一遍：往共享域写一个时间戳再读回来。
+    /// 返回 "ok" 表示这个进程确实能读写共享容器；"no-suite" 表示连 suite 都拿不到；
+    /// "mismatch" 表示写进去读不回来（重签时 group 只给了一边，两个进程各写各的）。
+    static func groupProbe() -> String {
+        let key = "watch.probe"
+        guard UserDefaults(suiteName: suiteName) != nil else { return "no-suite" }
+        let stamp = String(Date().timeIntervalSince1970)
+        defaults.set(stamp, forKey: key)
+        let back = defaults.string(forKey: key) ?? "nil"
+        return back == stamp ? "ok" : "mismatch"
+    }
+
+    /// 当前进程看到的 App Group 容器路径；"nil" 说明这个进程没有 App Group 权限。
+    static var containerPath: String { containerURL?.path ?? "nil" }
+
+    /// 给用户看的容器诊断摘要（App 与扩展都用它，方便对照）。
+    static func containerDiagnostics() -> String {
+        "路径=\(containerPath)；自检=\(groupProbe())"
+    }
 
     static func readDiag() -> Diag {
         guard let data = defaults.data(forKey: diagKey),
