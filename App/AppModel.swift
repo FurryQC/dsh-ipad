@@ -151,7 +151,9 @@ final class AppModel: ObservableObject {
     }
 
     /// 把外部选中的文件读进来（带安全作用域访问 + iCloud 下载兜底）。
-    func addAttachment(from url: URL) {
+    /// 返回 nil 表示成功；否则是给人看的失败原因，调用方要当场显示出来。
+    @discardableResult
+    func importAttachment(from url: URL) -> String? {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         do {
@@ -168,9 +170,17 @@ final class AppModel: ObservableObject {
                                                      kind: isImage ? .image : .file)
             pendingAttachments.append(ref)
             toast = "已加入 \(url.lastPathComponent)"
+            return nil
         } catch {
-            toast = "文件没加上：\(error.localizedDescription)"
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            toast = "文件没加上：\(reason)"
+            return "读不到 \(url.lastPathComponent)：\(reason)"
         }
+    }
+
+    /// 兼容旧调用点。
+    func addAttachment(from url: URL) {
+        _ = importAttachment(from: url)
     }
 
     // MARK: - 会话操作

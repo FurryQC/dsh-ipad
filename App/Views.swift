@@ -1012,7 +1012,10 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let types: [UTType] = mode == .folders ? [.folder] : [.item]
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
+        // 选文件时让系统把文件复制进我们的沙盒：跨 App 容器/Files 里的文件如果不 asCopy，
+        // 拿回来的是 security-scoped URL，读失败时表现就是「点了打开没反应」。
+        // 选文件夹必须 asCopy: false —— 复制一份文件夹没有意义，要的是 bookmark 授权。
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: mode == .files)
         picker.allowsMultipleSelection = mode == .files
         picker.shouldShowFileExtensions = true
         picker.delegate = context.coordinator
@@ -1101,8 +1104,15 @@ struct AttachmentPanel: View {
             DocumentPicker(mode: .files) { urls in
                 showFiles = false
                 guard !urls.isEmpty else { return }
-                // 统一交给 AppModel：它负责安全作用域访问、iCloud 下载兜底和 toast 反馈。
-                model.handlePicked(urls, folders: false)
+                // 统一交给 AppModel：它负责安全作用域访问、iCloud 下载兜底和错误文案。
+                // 失败必须在面板里当场弹出来 —— 面板盖着的时候底层 toast 看不见。
+                if let failure = model.importAttachment(from: urls[0]) {
+                    errorText = failure
+                    return
+                }
+                for url in urls.dropFirst() {
+                    _ = model.importAttachment(from: url)
+                }
                 dismiss()
             }
             .ignoresSafeArea()
