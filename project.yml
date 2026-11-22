@@ -25,8 +25,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc
         PRODUCT_NAME: DSH
         # Version name is chosen by the user for every delivery; build number matches it.
-        MARKETING_VERSION: "b27"
-        CURRENT_PROJECT_VERSION: "27"
+        MARKETING_VERSION: "b28"
+        CURRENT_PROJECT_VERSION: "28"
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
@@ -55,8 +55,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc.broadcast
         PRODUCT_NAME: DSHBroadcast
-        MARKETING_VERSION: "b27"
-        CURRENT_PROJECT_VERSION: "27"
+        MARKETING_VERSION: "b28"
+        CURRENT_PROJECT_VERSION: "28"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         INFOPLIST_FILE: BroadcastExtension/Info.plist
