@@ -23,6 +23,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var announcedFirstSend = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        // 先把「能不能发通知」当硬门槛：识别结果只能靠通知送到用户眼前，
+        // 没授权就等于白跑；这里用系统错误框把原因直接摆到脸上。
+        if !Self.notificationAuthorized() {
+            finishBroadcastWithError(Self.watchError(
+                "扩展跑起来了，但 DSH 的通知权限没开 —— 识别结果没地方显示，所以先停下。\n\n请到：设置 → 通知 → DSH → 打开「允许通知」（横幅也打开）。\n然后在 App 的「屏幕识别」页点一次「检查权限」，确认变成「已允许」再重新开始广播。"
+            ))
+            return
+        }
+
         let outcome = WatchConfigClient.fetch()
         switch outcome {
         case .success(let loaded):
@@ -118,6 +127,24 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private static func watchError(_ message: String) -> NSError {
         NSError(domain: "com.dsh.qc.broadcast", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    /// 同步查一次通知授权状态（扩展里没有 UI，只能这样问）。
+    private static func notificationAuthorized() -> Bool {
+        let center = UNUserNotificationCenter.current()
+        var authorized = false
+        let semaphore = DispatchSemaphore(value: 0)
+        center.getNotificationSettings { settings in
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                authorized = true
+            default:
+                authorized = false
+            }
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + 2.0)
+        return authorized
     }
 
     private static func makeJPEG(from sampleBuffer: CMSampleBuffer, context: CIContext) -> Data? {
