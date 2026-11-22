@@ -83,6 +83,8 @@ final class AppModel: ObservableObject {
     private var warnedThisLaunch = false
     /// 被 stop 的旧任务收尾时不能改动新任务的状态。
     private var runID = UUID()
+    /// 正在等模型起标题的会话。防止同一轮触发两次请求。
+    private var autoTitling: Set<UUID> = []
     /// send 之后、真正开跑之前（可能中间插了个「别切走」确认框），附件得先存着。
     private var queuedAttachments: [AttachmentRef] = []
 
@@ -209,12 +211,52 @@ final class AppModel: ObservableObject {
         let session = ChatSession(title: mode.title, mode: mode)
         sessions.insert(session, at: 0)
         currentSessionID = session.id
+        sortSessions()
         save()
     }
 
-    /// 切换当前会话的模式。运行中不改，免得同一轮里规则前后不一致。
-    func setMode(_ mode: SessionMode) {
+    /// 「自定义壁纸」：新开一个工作会话，让模型把单文件 HTML 写到工作目录的 wallpaper.html，
+    /// 跑完自动装成壁纸。用户描述只要一句，剩下的排版约束由我们补全。
+    func startCustomWallpaper(prompt: String) {
         guard !isRunning else { return }
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let session = ChatSession(title: "自定义壁纸", mode: .work)
+        sessions.insert(session, at: 0)
+        currentSessionID = session.id
+        sortSessions()
+        mutate(session.id) { $0.items.append(ChatItem(role: .user, text: trimmed)) }
+        save()
+        let instructions = """
+        用户想要一张网页壁纸（HTML 背景）。他的描述是：
+
+        \(trimmed)
+
+        请用 write_file 在工作目录根下写一个单文件 HTML，路径固定为 wallpaper.html。硬性要求：
+        - 单文件自包含：CSS/JS 全部内联，不引用任何外部网络资源（不要 CDN、不要外链图片/字体）。
+        - 铺满整个屏幕：html、body 设 margin:0;padding:0;width:100%;height:100%;overflow:hidden；画面要适配任意宽高比，不能出现滚动条。
+        - 按深色底设计，主体不要居中挤满（App 会在上面盖半透明面板，边缘留一点呼吸空间）。
+        - 可以用 CSS 动画或 canvas，但不要请求摄像头/麦克风，不要出声。
+        写完后用 file_info 确认 wallpaper.html 存在，再用一句话告诉用户效果。
+        """
+        startRun(prompt: instructions, appendUserMessage: false)
+    }
+
+    /// 自定义壁纸跑完后自动装上：只认标题为「自定义壁纸」的会话，且文件确实存在。
+    private func applyGeneratedWallpaperIfNeeded(sessionID: UUID) {
+        guard sessions.first(where: { $0.id == sessionID })?.title == "自定义壁纸" else { return }
+        let url = Workspace.root.appendingPathComponent("wallpaper.html")
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try WallpaperStore.shared.importHTML(from: url)
+            toast = "壁纸已经换上了"
+        } catch {
+            toast = "壁纸没装上：\((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+        }
+    }
+
+    /// 切换当前会话的模式。运行中不改，免得同一轮里规则前后不一致。
+    func setMode(_ mode: SessionMode) {        guard !isRunning else { return }
         mutate(currentSessionID) { session in
             guard session.mode != mode else { return }
             session.mode = mode
@@ -235,6 +277,123 @@ final class AppModel: ObservableObject {
         if currentSessionID == id, let first = sessions.first {
             currentSessionID = first.id
         }
+        save()
+    }
+
+    // MARK: - 会话管理（重命名 / 置顶 / 多选删除 / 自动标题）
+
+    /// 重命名。空标题直接忽略，免得列表里出现一行空白。
+    func renameSession(_ id: UUID, title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        mutate(id) { $0.title = String(trimmed.prefix(40)) }
+        save()
+    }
+
+    /// 置顶开关。置顶的排最上面，其余按最近更新时间。
+    func togglePin(_ id: UUID) {
+        mutate(id) { $0.pinned.toggle() }
+        sortSessions()
+        save()
+    }
+
+    /// 多选删除。全删空了就留一个新的工作会话，免得侧栏整块消失。
+    func deleteSessions(_ ids: Set<UUID>) {
+        guard !isRunning, !ids.isEmpty else { return }
+        let remaining = sessions.filter { !ids.contains($0.id) }
+        sessions = remaining.isEmpty ? [ChatSession(title: SessionMode.work.title, mode: .work)] : remaining
+        if !sessions.contains(where: { $0.id == currentSessionID }) {
+            currentSessionID = sessions[0].id
+        }
+        save()
+    }
+
+    /// 导入 DeepSeek App 导出的对话包。返回一句给用户看的结果。
+    @discardableResult
+    func importDeepSeekSessions(from url: URL) -> String {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let result = try DeepSeekImport.load(from: url)
+            guard !result.sessions.isEmpty else { return "导出包里没有可导入的对话。" }
+            sessions.insert(contentsOf: result.sessions, at: 0)
+            currentSessionID = result.sessions[0].id
+            sortSessions()
+            save()
+            let skipped = result.skipped > 0 ? "，跳过 \(result.skipped) 个空会话" : ""
+            return "已导入 \(result.sessions.count) 个对话\(skipped)。"
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return "导入失败：\(reason)"
+        }
+    }
+
+    /// 置顶在前，同组按更新时间倒序。
+    private func sortSessions() {
+        sessions.sort { lhs, rhs in
+            if lhs.pinned != rhs.pinned { return lhs.pinned }
+            return lhs.updatedAt > rhs.updatedAt
+        }
+    }
+
+    /// 第一轮回答结束后把这段对话总结成 ≤20 字的标题。
+    /// 模型请求失败就退回「首条消息前 20 字」—— 至少比「新对话」有信息。
+    private func autoTitleIfNeeded(sessionID: UUID) {
+        guard !autoTitling.contains(sessionID) else { return }
+        guard let session = sessions.first(where: { $0.id == sessionID }) else { return }
+        let defaults = [SessionMode.chat.title, SessionMode.work.title]
+        guard defaults.contains(session.title) else { return }
+        guard let firstUser = session.items.first(where: { $0.role == .user })?.text else { return }
+        let text = firstUser.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        autoTitling.insert(sessionID)
+
+        let flat = text.replacingOccurrences(of: "\n", with: " ")
+        let fallback = String(flat.prefix(20))
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, let url = MessagesAPI.endpoint(base: baseURL) else {
+            applyTitle(fallback, sessionID: sessionID)
+            return
+        }
+        let options = MessagesAPI.RequestOptions(
+            model: "deepseek-flash",
+            system: "你负责给对话起标题。只输出一个不超过 20 个字的中文标题，不加引号、不加标点、不解释。",
+            effort: "off",
+            maxTokens: 64,
+            messages: [["role": "user", "content": "给这段用户需求起个标题：" + String(flat.prefix(400))]],
+            tools: []
+        )
+        guard let body = MessagesAPI.body(options) else {
+            applyTitle(fallback, sessionID: sessionID)
+            return
+        }
+        let request = MessagesAPI.request(url: url, apiKey: key, body: body)
+        Task { @MainActor [weak self] in
+            var title = ""
+            if let turn = try? await MessagesAPI.stream(request: request, onText: { _ in }, onReasoning: { _ in }) {
+                title = turn.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            title = title.replacingOccurrences(of: "\"", with: "")
+                .replacingOccurrences(of: "「", with: "")
+                .replacingOccurrences(of: "」", with: "")
+                .replacingOccurrences(of: "\n", with: " ")
+            if title.isEmpty { title = fallback }
+            self?.applyTitle(String(title.prefix(20)), sessionID: sessionID)
+        }
+    }
+
+    /// 只在标题还是默认值时写，避免覆盖用户手动改过的名字。
+    private func applyTitle(_ title: String, sessionID: UUID) {
+        autoTitling.remove(sessionID)
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let defaults = [SessionMode.chat.title, SessionMode.work.title]
+        mutate(sessionID) { session in
+            if defaults.contains(session.title) {
+                session.title = trimmed
+            }
+        }
+        sortSessions()
         save()
     }
 
@@ -469,6 +628,8 @@ final class AppModel: ObservableObject {
         runTask = nil
         endBackgroundGrace()
         save()
+        autoTitleIfNeeded(sessionID: sessionID)
+        applyGeneratedWallpaperIfNeeded(sessionID: sessionID)
     }
 
     // MARK: - 网络

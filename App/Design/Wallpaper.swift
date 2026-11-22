@@ -26,6 +26,8 @@ struct WallpaperSettings: Codable, Equatable {
     var startSecond: Double = 0
     /// 壁纸是不是网页。为 true 时用 WebView 跑 Documents/wallpaper.html，照片和视频都不生效。
     var hasHTML: Bool = false
+    /// 用过的壁纸，最新的在前，最多 8 条。文件在 Documents/wallpapers/ 下。
+    var history: [WallpaperHistoryItem] = []
 
     init() {}
 
@@ -39,6 +41,7 @@ struct WallpaperSettings: Codable, Equatable {
         case offsetY
         case startSecond
         case hasHTML
+        case history
     }
 
     /// 旧版本只存了 blur / dim / hasImage。缺的字段补默认值，升级后壁纸不能凭空消失。
@@ -53,7 +56,19 @@ struct WallpaperSettings: Codable, Equatable {
         offsetY = try container.decodeIfPresent(Double.self, forKey: .offsetY) ?? 0
         startSecond = try container.decodeIfPresent(Double.self, forKey: .startSecond) ?? 0
         hasHTML = try container.decodeIfPresent(Bool.self, forKey: .hasHTML) ?? false
+        history = try container.decodeIfPresent([WallpaperHistoryItem].self, forKey: .history) ?? []
     }
+}
+
+/// 一条壁纸历史。只是个索引：真正的文件在 Documents/wallpapers/<fileName>。
+struct WallpaperHistoryItem: Codable, Identifiable, Equatable {
+    /// 主键。跟 fileName 里的 UUID 不是同一个，改文件名不会影响条目标识。
+    var id: UUID
+    /// "image" / "video" / "html"。存字符串而不是枚举：以后加种类不用动存档格式。
+    var kind: String
+    /// wallpapers/ 下的文件名，例如 <uuid>.jpg。
+    var fileName: String
+    var createdAt: Date
 }
 
 /// 壁纸读写的失败原因。直接把它显示给用户，不把底层错误文本端上去。
@@ -116,6 +131,21 @@ final class WallpaperStore: ObservableObject {
         return FileManager.default.fileExists(atPath: htmlURL.path) ? htmlURL : nil
     }
 
+    /// 三种壁纸里有没有任意一种。网页壁纸不算 hasImage，预览和"清除"入口要看这个。
+    var hasWallpaper: Bool {
+        settings.hasHTML || settings.hasImage
+    }
+
+    /// 壁纸历史文件目录。用到的时候才建，空目录没必要提前造。
+    var wallpapersDirectory: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("wallpapers", isDirectory: true)
+    }
+
+    /// 历史缩略图缓存。历史一变就整批重读：8 张 160px 的图，开销可以忽略。
+    /// 直接渲染时从磁盘读 2048px 的原图会把 Form 拖慢。
+    @Published private(set) var historyThumbs: [UUID: UIImage] = [:]
+
     /// 换了一个 html 文件后 WebView 得重新加载：路径不变，靠这个计数触发刷新。
     @Published private(set) var htmlReloadToken = 0
 
@@ -136,12 +166,32 @@ final class WallpaperStore: ObservableObject {
            let stored = try? JSONDecoder().decode(WallpaperSettings.self, from: data) {
             settings = stored
         }
+        applyActualWallpaperState()
+        refreshHistoryThumbs()
+    }
 
-        let videoExists = FileManager.default.fileExists(atPath: videoURL.path)
-        if settings.hasVideo && videoExists {
+    /// 按磁盘上真实存在的文件把三个互斥标记对齐，优先级：网页 > 视频 > 照片。
+    /// 文件被删掉、或者旧版本存下半开状态（比如 hasHTML 和 hasImage 同时为真）时，这里收干净。
+    private func applyActualWallpaperState() {
+        if settings.hasHTML, FileManager.default.fileExists(atPath: htmlURL.path) {
+            image = nil
+            videoDuration = 0
+            if settings.hasImage {
+                settings.hasImage = false
+            }
+            if settings.hasVideo {
+                settings.hasVideo = false
+            }
+            return
+        }
+
+        if settings.hasVideo, FileManager.default.fileExists(atPath: videoURL.path) {
             image = nil
             if !settings.hasImage {
                 settings.hasImage = true
+            }
+            if settings.hasHTML {
+                settings.hasHTML = false
             }
             refreshVideoDuration()
             return
@@ -155,6 +205,9 @@ final class WallpaperStore: ObservableObject {
             if settings.hasVideo {
                 settings.hasVideo = false
             }
+            if settings.hasHTML {
+                settings.hasHTML = false
+            }
             return
         }
 
@@ -165,6 +218,9 @@ final class WallpaperStore: ObservableObject {
         }
         if settings.hasVideo {
             settings.hasVideo = false
+        }
+        if settings.hasHTML {
+            settings.hasHTML = false
         }
     }
 
@@ -179,12 +235,15 @@ final class WallpaperStore: ObservableObject {
         } catch {
             throw WallpaperError.message("壁纸写不进沙盒：\(error.localizedDescription)")
         }
-        // 照片和视频互斥：同一时间只留一种壁纸，背景和设置页的判断才不用两头猜。
+        // 三种壁纸互斥：换照片就把视频和网页一起作废，背景只看一个标记决定画什么。
         try? FileManager.default.removeItem(at: videoURL)
+        try? FileManager.default.removeItem(at: htmlURL)
         image = UIImage(data: jpeg)
         videoDuration = 0
         settings.hasVideo = false
+        settings.hasHTML = false
         settings.hasImage = true
+        recordHistory(kind: "image", data: jpeg, preferredExtension: "jpg")
     }
 
     /// 导入一段视频：原文件拷进 Documents（不转码），照片壁纸一并清掉。
@@ -205,11 +264,15 @@ final class WallpaperStore: ObservableObject {
         }
 
         try? FileManager.default.removeItem(at: imageURL)
+        try? FileManager.default.removeItem(at: htmlURL)
         image = nil
+        videoDuration = 0
         settings.hasVideo = true
         settings.hasImage = true
+        settings.hasHTML = false
         settings.startSecond = min(settings.startSecond, 10)
         refreshVideoDuration()
+        recordHistory(kind: "video", copying: destination, preferredExtension: "mov")
     }
 
     /// 导入网页壁纸：拷成 Documents/wallpaper.html，照片和视频一并清掉。
@@ -226,8 +289,10 @@ final class WallpaperStore: ObservableObject {
             }
         }
 
+        guard let data = try? Data(contentsOf: source) else {
+            throw WallpaperError.message("这个 html 读不出来：文件可能已经不在原来的位置了。")
+        }
         do {
-            let data = try Data(contentsOf: source)
             try data.write(to: htmlURL, options: .atomic)
         } catch {
             throw WallpaperError.message("这个 html 拷不进沙盒：\(error.localizedDescription)")
@@ -238,9 +303,10 @@ final class WallpaperStore: ObservableObject {
         image = nil
         videoDuration = 0
         settings.hasVideo = false
+        settings.hasImage = false
         settings.hasHTML = true
-        settings.hasImage = true
         htmlReloadToken += 1
+        recordHistory(kind: "html", data: data, preferredExtension: "html")
     }
 
     /// 清除壁纸：删照片和视频、关标记、画面参数回到原始状态。文件本来就不在也当成功。
@@ -257,6 +323,153 @@ final class WallpaperStore: ObservableObject {
         settings.offsetX = 0
         settings.offsetY = 0
         settings.startSecond = 0
+    }
+
+    /// 应用一条历史：把它的文件复制成当前的 wallpaper.*，并按种类把三个标记对齐。
+    /// 文件被外面删了就把那一条从历史里摘掉，别让用户点了没反应。
+    func applyHistory(_ item: WallpaperHistoryItem) {
+        let source = historyFileURL(item.fileName)
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            settings.history.removeAll { $0.id == item.id }
+            refreshHistoryThumbs()
+            return
+        }
+
+        switch item.kind {
+        case "video":
+            do {
+                try? FileManager.default.removeItem(at: videoURL)
+                try FileManager.default.copyItem(at: source, to: videoURL)
+            } catch {
+                return
+            }
+            try? FileManager.default.removeItem(at: imageURL)
+            try? FileManager.default.removeItem(at: htmlURL)
+            image = nil
+            settings.hasVideo = true
+            settings.hasImage = true
+            settings.hasHTML = false
+            refreshVideoDuration()
+        case "html":
+            guard let data = try? Data(contentsOf: source) else { return }
+            do {
+                try data.write(to: htmlURL, options: .atomic)
+            } catch {
+                return
+            }
+            try? FileManager.default.removeItem(at: imageURL)
+            try? FileManager.default.removeItem(at: videoURL)
+            image = nil
+            videoDuration = 0
+            settings.hasVideo = false
+            settings.hasImage = false
+            settings.hasHTML = true
+            htmlReloadToken += 1
+        default:
+            do {
+                try? FileManager.default.removeItem(at: imageURL)
+                try FileManager.default.copyItem(at: source, to: imageURL)
+            } catch {
+                return
+            }
+            try? FileManager.default.removeItem(at: videoURL)
+            try? FileManager.default.removeItem(at: htmlURL)
+            if let data = try? Data(contentsOf: imageURL) {
+                image = UIImage(data: data)
+            } else {
+                image = nil
+            }
+            videoDuration = 0
+            settings.hasVideo = false
+            settings.hasHTML = false
+            settings.hasImage = true
+        }
+    }
+
+    /// 清空历史：条目和 wallpapers/ 里的文件一起删。当前壁纸不动。
+    func clearHistory() {
+        settings.history = []
+        historyThumbs = [:]
+        try? FileManager.default.removeItem(at: wallpapersDirectory)
+    }
+
+    // MARK: - 历史文件
+
+    /// 把一份数据存进 wallpapers/ 并记进历史。写失败就当没记，不能影响刚导入成功的壁纸。
+    private func recordHistory(kind: String, data: Data, preferredExtension ext: String) {
+        let fileName = "\(UUID().uuidString).\(ext)"
+        let url = historyFileURL(fileName)
+        do {
+            try ensureWallpapersDirectory()
+            try data.write(to: url, options: .atomic)
+        } catch {
+            return
+        }
+        appendHistory(kind: kind, fileName: fileName)
+    }
+
+    /// 同上，但源文件已经在磁盘上（视频），直接再复制一份。
+    private func recordHistory(kind: String, copying source: URL, preferredExtension ext: String) {
+        let fileName = "\(UUID().uuidString).\(ext)"
+        let url = historyFileURL(fileName)
+        do {
+            try ensureWallpapersDirectory()
+            try? FileManager.default.removeItem(at: url)
+            try FileManager.default.copyItem(at: source, to: url)
+        } catch {
+            return
+        }
+        appendHistory(kind: kind, fileName: fileName)
+    }
+
+    private func ensureWallpapersDirectory() throws {
+        try FileManager.default.createDirectory(at: wallpapersDirectory,
+                                                withIntermediateDirectories: true)
+    }
+
+    private func historyFileURL(_ fileName: String) -> URL {
+        wallpapersDirectory.appendingPathComponent(fileName)
+    }
+
+    private func appendHistory(kind: String, fileName: String) {
+        let item = WallpaperHistoryItem(id: UUID(), kind: kind, fileName: fileName, createdAt: Date())
+        settings.history.insert(item, at: 0)
+        trimHistory()
+        refreshHistoryThumbs()
+    }
+
+    /// 只留最近 8 条：超出的是最久没用过的，连文件一起删，不然两个视频就能吃掉几百 MB。
+    private func trimHistory() {
+        while settings.history.count > 8 {
+            let dropped = settings.history.removeLast()
+            try? FileManager.default.removeItem(at: historyFileURL(dropped.fileName))
+        }
+    }
+
+    /// 重读所有缩略图。最多 8 张 160px，同步解码也就几毫秒一张，不值得为它开线程。
+    private func refreshHistoryThumbs() {
+        var thumbs: [UUID: UIImage] = [:]
+        for item in settings.history where item.kind != "html" {
+            if let thumb = WallpaperStore.historyThumbnail(at: historyFileURL(item.fileName)) {
+                thumbs[item.id] = thumb
+            }
+        }
+        historyThumbs = thumbs
+    }
+
+    /// 历史格子的缩略图：160px 够 60×60 用，不用把整张 2048px 的壁纸读进内存。
+    private static func historyThumbnail(at url: URL) -> UIImage? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let options: [String: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways as String: true,
+            kCGImageSourceCreateThumbnailWithTransform as String: true,
+            kCGImageSourceThumbnailMaxPixelSize as String: 160
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage, scale: 1, orientation: .up)
     }
 
     /// 调模糊。夹在 0...24 内：再大壁纸就糊成一块色斑，没有"壁纸"的意义了。
@@ -381,22 +594,12 @@ struct WallpaperBackground<Content: View>: View {
     @ViewBuilder
     private var wallpaper: some View {
         if store.settings.hasHTML {
-            ZStack {
-                // WebView 是透明底的，垫一层黑：网页自己没铺满时不会漏出系统背景。
-                Color.black
-                if let url = store.htmlURLForDisplay {
-                    HTMLWallpaperView(fileURL: url, reloadToken: store.htmlReloadToken)
-                }
-                // WKWebView 的内容也吃不到 SwiftUI 的 blur，用毛玻璃层近似。
-                if store.settings.blur > 0.5 {
-                    VideoBlurVeil(intensity: store.settings.blur / 24)
-                        .allowsHitTesting(false)
-                }
-                Color.black
-                    .opacity(store.settings.dim)
-                    .allowsHitTesting(false)
-            }
-            .allowsHitTesting(false)
+            HTMLWallpaperLayer(url: store.htmlURLForDisplay,
+                               reloadToken: store.htmlReloadToken,
+                               blur: store.settings.blur,
+                               dim: store.settings.dim)
+                // 网页自己撑不满时也不能溢出到内容层之外。
+                .clipped()
         } else if store.settings.hasImage {
             WallpaperSurface(image: store.image,
                              videoURL: store.videoURLForPlayback,
@@ -423,6 +626,10 @@ struct WallpaperBackground<Content: View>: View {
 struct WallpaperPickerView: View {
     @ObservedObject var store: WallpaperStore
 
+    /// 用户在"自定义壁纸"里写了描述、点了「让 AI 写一个」时回调出去。
+    /// 这一页不自己起对话：起对话、拼提示词是调用方的事。
+    private let onCustomPrompt: ((String) -> Void)?
+
     @Environment(\.dismiss) private var dismiss
     @State private var pickedItem: PhotosPickerItem?
     @State private var pickedVideoItem: PhotosPickerItem?
@@ -430,19 +637,24 @@ struct WallpaperPickerView: View {
     @State private var showHTMLImporter = false
     @State private var isLoading = false
     @State private var errorText: String?
+    @State private var customPrompt = ""
 
-    init(store: WallpaperStore = WallpaperStore.shared) {
+    init(store: WallpaperStore = WallpaperStore.shared,
+         onCustomPrompt: ((String) -> Void)? = nil) {
         _store = ObservedObject(wrappedValue: store)
+        self.onCustomPrompt = onCustomPrompt
     }
 
     var body: some View {
         NavigationView {
             Form {
                 previewSection
+                historySection
                 imageSection
                 videoSection
                 htmlSection
                 adjustSection
+                customSection
                 clearSection
             }
             .scrollContentBackground(.hidden)
@@ -509,16 +721,15 @@ struct WallpaperPickerView: View {
     private var previewSection: some View {
         Section {
             ZStack {
-                if store.settings.hasImage {
+                if store.settings.hasHTML {
+                    HTMLWallpaperLayer(url: store.htmlURLForDisplay,
+                                       reloadToken: store.htmlReloadToken,
+                                       blur: store.settings.blur,
+                                       dim: store.settings.dim)
+                } else if store.settings.hasImage {
                     WallpaperSurface(image: store.image,
                                      videoURL: store.videoURLForPlayback,
                                      settings: store.settings)
-                    .overlay(alignment: .bottomLeading) {
-                        Text("示例文字")
-                            .font(Theme.title(15))
-                            .foregroundColor(Theme.textPrimary)
-                            .padding(10)
-                    }
                 } else {
                     Theme.bgGradient
                     Text("还没有自定义壁纸，现在用的是暗色底。")
@@ -527,11 +738,121 @@ struct WallpaperPickerView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
                 }
+
+                // 示例文字：壁纸再花，正文也得读得清，预览里就要能验证这一点。
+                if store.hasWallpaper {
+                    VStack {
+                        Spacer(minLength: 0)
+                        HStack {
+                            Text("示例文字")
+                                .font(Theme.title(15))
+                                .foregroundColor(Theme.textPrimary)
+                                .padding(10)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
             }
             .frame(height: 170)
             .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous))
             .listRowInsets(EdgeInsets())
             .listRowBackground(Theme.surface)
+        }
+    }
+
+    /// 历史：横向 60×60 的格子，点一下直接切过去。网页壁纸没有缩略图，用图标顶着。
+    private var historySection: some View {
+        Section {
+            if store.settings.history.isEmpty {
+                Text("还没有历史。导入过的壁纸会留在这里，最多 8 张。")
+                    .font(Theme.body(13))
+                    .foregroundColor(Theme.textTertiary)
+                    .listRowBackground(Theme.surface)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(store.settings.history) { item in
+                            Button {
+                                store.applyHistory(item)
+                            } label: {
+                                historyCell(item)
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .listRowInsets(EdgeInsets(top: 8, leading: Theme.pad, bottom: 8, trailing: Theme.pad))
+                .listRowBackground(Theme.surface)
+
+                Button(role: .destructive) {
+                    store.clearHistory()
+                } label: {
+                    Text("清空历史")
+                }
+                .listRowBackground(Theme.surface)
+            }
+        } header: {
+            Text("历史")
+        } footer: {
+            Text("只留最近 8 张。点一下直接换成那张壁纸；清空历史只删记录，不动当前壁纸。")
+                .foregroundColor(Theme.textTertiary)
+        }
+    }
+
+    private func historyCell(_ item: WallpaperHistoryItem) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
+                .fill(Theme.surfaceStrong)
+            if item.kind == "html" {
+                Image(systemName: "chevron.left.forwardslash.chevron.right")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(Theme.accent)
+            } else if let thumb = store.historyThumbs[item.id] {
+                Image(uiImage: thumb)
+                    .resizable()
+                    .scaledToFill()
+            } else if item.kind == "video" {
+                Image(systemName: "video")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(Theme.textSecondary)
+            } else {
+                Image(systemName: "photo")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(Theme.textSecondary)
+            }
+        }
+        .frame(width: 60, height: 60)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
+                .stroke(Theme.stroke, lineWidth: 1)
+        )
+    }
+
+    /// 自定义壁纸入口：把一句话描述交出去，由调用方开对话让 agent 写 wallpaper.html。
+    private var customSection: some View {
+        Section {
+            TextField("描述你想要的壁纸…", text: $customPrompt)
+                .foregroundColor(Theme.textPrimary)
+                .listRowBackground(Theme.surface)
+            Button {
+                submitCustomPrompt()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "sparkles")
+                        .foregroundColor(Theme.accent)
+                    Text("让 AI 写一个")
+                        .foregroundColor(Theme.textPrimary)
+                    Spacer(minLength: 0)
+                }
+            }
+            .listRowBackground(Theme.surface)
+        } header: {
+            Text("自定义壁纸")
+        } footer: {
+            Text("用一句话描述想要的效果，会新开一个对话让 agent 写 .html 壁纸；写好后再回到这里导入。")
+                .foregroundColor(Theme.textTertiary)
         }
     }
 
@@ -573,7 +894,9 @@ struct WallpaperPickerView: View {
                 HStack(spacing: 10) {
                     Image(systemName: "photo.on.rectangle.angled")
                         .foregroundColor(Theme.accent)
-                    Text(store.settings.hasImage && !store.settings.hasVideo ? "换一张照片" : "从照片里选一张")
+                    Text(store.settings.hasImage && !store.settings.hasVideo && !store.settings.hasHTML
+                         ? "换一张照片"
+                         : "从照片里选一张")
                         .foregroundColor(Theme.textPrimary)
                     Spacer(minLength: 0)
                     if isLoading {
@@ -585,7 +908,7 @@ struct WallpaperPickerView: View {
         } header: {
             Text("照片")
         } footer: {
-            Text("照片和视频二选一，导入新的会覆盖旧的。壁纸只存在这台设备上，不会上传。")
+            Text("照片、视频、网页三选一：导入新的会替换当前壁纸，旧的留在历史里可以切回去。壁纸只存在这台设备上，不会上传。")
                 .foregroundColor(Theme.textTertiary)
         }
     }
@@ -665,7 +988,7 @@ struct WallpaperPickerView: View {
 
     private var clearSection: some View {
         Section {
-            if store.settings.hasImage {
+            if store.hasWallpaper {
                 Button(role: .destructive) {
                     store.clear()
                 } label: {
@@ -703,6 +1026,17 @@ struct WallpaperPickerView: View {
 
     private func percentText(_ value: Double) -> String {
         return String(format: "%+.0f%%", value * 100)
+    }
+
+    /// 把描述交给调用方，然后关掉这一页：新对话起来之后这一页也没用了。
+    private func submitCustomPrompt() {
+        let text = customPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            errorText = "先写一句你想要的壁纸描述。"
+            return
+        }
+        onCustomPrompt?(text)
+        dismiss()
     }
 
     // MARK: - 选照片 / 选视频

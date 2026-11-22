@@ -112,6 +112,12 @@ struct RootView: View {
 struct SidebarCard: View {
     @EnvironmentObject private var model: AppModel
     @Binding var showSidebar: Bool
+    /// 正在重命名的会话；非 nil 时弹输入框。
+    @State private var renaming: ChatSession?
+    @State private var renameText = ""
+    /// 多选模式。进入后点一行是勾选，不再是切会话。
+    @State private var selecting = false
+    @State private var selection: Set<UUID> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -127,6 +133,16 @@ struct SidebarCard: View {
             }
         }
         .floatingPanel()
+        .alert("重命名对话", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("对话名", text: $renameText)
+            Button("保存") {
+                if let target = renaming { model.renameSession(target.id, title: renameText) }
+                renaming = nil
+            }
+            Button("取消", role: .cancel) { renaming = nil }
+        } message: {
+            Text("给这个对话起个短名字，列表里显示的就是它。")
+        }
     }
 
     private var header: some View {
@@ -141,6 +157,26 @@ struct SidebarCard: View {
                 .padding(.vertical, 2)
                 .background(Capsule().fill(Color.white.opacity(0.10)))
             Spacer(minLength: 0)
+            if selecting {
+                Button {
+                    selecting = false
+                    selection = []
+                } label: {
+                    Text("取消")
+                        .font(.system(size: 13))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                Button {
+                    model.deleteSessions(selection)
+                    selecting = false
+                    selection = []
+                } label: {
+                    Text("删除 \(selection.count)")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(selection.isEmpty ? Theme.textTertiary : Theme.danger)
+                }
+                .disabled(selection.isEmpty)
+            } else {
             Button {
                 withAnimation(.easeInOut(duration: 0.2)) { showSidebar = false }
             } label: {
@@ -168,6 +204,7 @@ struct SidebarCard: View {
                     .background(Circle().fill(Color.white.opacity(0.10)))
             }
             .disabled(model.isRunning)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.top, 14)
@@ -176,20 +213,39 @@ struct SidebarCard: View {
 
     private func row(_ session: ChatSession) -> some View {
         let selected = session.id == model.currentSessionID
+        let checked = selection.contains(session.id)
         return Button {
-            model.select(session.id)
+            if selecting {
+                if checked { selection.remove(session.id) } else { selection.insert(session.id) }
+            } else {
+                model.select(session.id)
+            }
         } label: {
             HStack(spacing: 9) {
-                Image(systemName: session.mode.systemImage)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(selected ? Theme.accent : Theme.textTertiary)
-                    .frame(width: 22, height: 22)
-                    .background(Circle().fill(Color.white.opacity(0.07)))
+                if selecting {
+                    Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 16))
+                        .foregroundColor(checked ? Theme.accent : Theme.textTertiary)
+                        .frame(width: 22, height: 22)
+                } else {
+                    Image(systemName: session.mode.systemImage)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(selected ? Theme.accent : Theme.textTertiary)
+                        .frame(width: 22, height: 22)
+                        .background(Circle().fill(Color.white.opacity(0.07)))
+                }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(session.title)
-                        .font(.system(size: 14, weight: selected ? .semibold : .regular))
-                        .foregroundColor(Theme.textPrimary)
-                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        if session.pinned {
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(Theme.accent)
+                        }
+                        Text(session.title)
+                            .font(.system(size: 14, weight: selected ? .semibold : .regular))
+                            .foregroundColor(Theme.textPrimary)
+                            .lineLimit(1)
+                    }
                     Text(subtitle(session))
                         .font(.system(size: 11))
                         .foregroundColor(Theme.textTertiary)
@@ -201,16 +257,33 @@ struct SidebarCard: View {
             .padding(.vertical, 9)
             .background(
                 RoundedRectangle(cornerRadius: 13, style: .continuous)
-                    .fill(selected ? Theme.accentSoft : Color.clear)
+                    .fill(checked || selected ? Theme.accentSoft : Color.clear)
             )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .contextMenu {
+            Button {
+                renameText = session.title
+                renaming = session
+            } label: {
+                Label("重命名", systemImage: "pencil")
+            }
+            Button {
+                model.togglePin(session.id)
+            } label: {
+                Label(session.pinned ? "取消置顶" : "置顶", systemImage: "pin")
+            }
+            Button {
+                selecting = true
+                selection = [session.id]
+            } label: {
+                Label("多选", systemImage: "checklist")
+            }
             Button(role: .destructive) {
                 model.deleteSession(session.id)
             } label: {
-                Label("删除对话", systemImage: "trash")
+                Label("删除", systemImage: "trash")
             }
             .disabled(model.isRunning || model.sessions.count <= 1)
         }

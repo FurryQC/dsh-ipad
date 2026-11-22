@@ -11,6 +11,7 @@ struct SettingsPage: View {
     @State private var showWallpaper = false
     @State private var showPlugins = false
     @State private var showWatch = false
+    @State private var showImport = false
     @State private var mounts: [MountedFolder] = []
     @State private var keyError: String?
     @State private var savedHint = false
@@ -48,7 +49,13 @@ struct SettingsPage: View {
         .onAppear { mounts = MountStore.shared.mounts }
         .onChange(of: model.mountsVersion) { _ in mounts = MountStore.shared.mounts }
         .sheet(isPresented: $showWallpaper) {
-            WallpaperPickerView()
+            WallpaperPickerView(onCustomPrompt: { prompt in
+                showWallpaper = false
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 320_000_000)
+                    model.startCustomWallpaper(prompt: prompt)
+                }
+            })
         }
         .sheet(isPresented: $showPlugins) {
             NavigationView {
@@ -57,6 +64,10 @@ struct SettingsPage: View {
         }
         .sheet(isPresented: $showWatch) {
             WatchView()
+        }
+        .sheet(isPresented: $showImport) {
+            ImportView()
+                .environmentObject(model)
         }
         .alert("API key 没存上", isPresented: Binding(get: { keyError != nil }, set: { if !$0 { keyError = nil } })) {
             Button("知道了", role: .cancel) { keyError = nil }
@@ -256,6 +267,15 @@ struct SettingsPage: View {
                         showPlugins = true
                     } label: {
                         SettingsNavRow(title: "插件", detail: "\(PluginHost.shared.plugins.count) 个 .js 插件")
+                    }
+                    .buttonStyle(.plain)
+
+                    SettingsDivider()
+
+                    Button {
+                        showImport = true
+                    } label: {
+                        SettingsNavRow(title: "导入 DeepSeek 对话", detail: "从 App 导出的 .zip 导入")
                     }
                     .buttonStyle(.plain)
 

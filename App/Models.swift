@@ -98,6 +98,8 @@ struct ChatSession: Identifiable, Codable {
     /// 这个会话累计消耗的 token（输入 / 输出分开记）。服务端每次都会回传 usage。
     var tokensIn: Int = 0
     var tokensOut: Int = 0
+    /// 置顶的会话固定在列表最上面。落盘到 sessions.json，重开还在。
+    var pinned: Bool = false
 
     /// 顶栏显示的合计。
     var tokensTotal: Int { tokensIn + tokensOut }
@@ -109,7 +111,8 @@ struct ChatSession: Identifiable, Codable {
          updatedAt: Date = Date(),
          lastRunSeconds: Double? = nil,
          tokensIn: Int = 0,
-         tokensOut: Int = 0) {
+         tokensOut: Int = 0,
+         pinned: Bool = false) {
         self.id = id
         self.title = title
         self.mode = mode
@@ -118,10 +121,11 @@ struct ChatSession: Identifiable, Codable {
         self.lastRunSeconds = lastRunSeconds
         self.tokensIn = tokensIn
         self.tokensOut = tokensOut
+        self.pinned = pinned
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, mode, items, updatedAt, lastRunSeconds, tokensIn, tokensOut
+        case id, title, mode, items, updatedAt, lastRunSeconds, tokensIn, tokensOut, pinned
     }
 
     /// 手写解码：旧版本会话文件里没有 mode 字段，缺了就按「工作」读回，
@@ -136,6 +140,7 @@ struct ChatSession: Identifiable, Codable {
         lastRunSeconds = try container.decodeIfPresent(Double.self, forKey: .lastRunSeconds)
         tokensIn = try container.decodeIfPresent(Int.self, forKey: .tokensIn) ?? 0
         tokensOut = try container.decodeIfPresent(Int.self, forKey: .tokensOut) ?? 0
+        pinned = try container.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
     }
 }
 
