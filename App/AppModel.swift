@@ -1,4 +1,5 @@
 import Combine
+import UniformTypeIdentifiers
 import Foundation
 import UIKit
 
@@ -56,6 +57,15 @@ final class AppModel: ObservableObject {
     @Published var errorText: String?
     @Published var showSwitchWarning = false
     /// 长按「修改」把原文塞回输入框；ChatCard 取走后置空。
+    static let systemPromptKey = "dsh.systemPromptOverride"
+
+    /// 系统提示词覆盖：用户（或 agent 自己调 app_config）写的内容，非空时整段替换内置提示词。
+    @Published var systemPromptOverride: String = ""
+    /// 由 AttachmentPanel / SettingsView 置上，RootView 在最高层统一弹系统选择器。
+    @Published var pickerRequest: PickerRequest?
+    /// 挂载列表变化时 +1，设置页据此重新读 MountStore。
+    @Published var mountsVersion = 0
+
     @Published var draftInjection: String?
     /// 一次性小提示（复制成功之类）。
     @Published var toast: String?
@@ -101,6 +111,66 @@ final class AppModel: ObservableObject {
         Workspace.prepare()
         PluginHost.shared.reload()
         loadSessions()
+        systemPromptOverride = UserDefaults.standard.string(forKey: AppModel.systemPromptKey) ?? ""
+        NotificationCenter.default.addObserver(forName: Tools.configChanged, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.reloadConfig() }
+        }
+    }
+
+    /// app_config 工具改完 UserDefaults 后会调这里，把新值同步回界面状态。
+    func reloadConfig() {
+        let defaults = UserDefaults.standard
+        if let value = defaults.string(forKey: "dsh.baseURL") { baseURL = value }
+        if let value = defaults.string(forKey: "dsh.model") { model = value }
+        if let value = defaults.string(forKey: "dsh.effort") { reasoningEffort = value }
+        let rounds = defaults.integer(forKey: "dsh.maxRounds")
+        if rounds >= 4 { maxRounds = rounds }
+        if let warn = defaults.object(forKey: "dsh.warnBeforeRun") as? Bool { warnBeforeRun = warn }
+        if let opacity = defaults.object(forKey: "dsh.cardOpacity") as? Double, opacity >= 0.15 {
+            cardOpacity = min(opacity, 1.0)
+        }
+        systemPromptOverride = defaults.string(forKey: AppModel.systemPromptKey) ?? ""
+    }
+
+    /// 系统选择器回来之后统一在这里落地：文件夹走授权，文件走附件。
+    func handlePicked(_ urls: [URL], folders: Bool) {
+        guard !urls.isEmpty else { return }
+        if folders {
+            for url in urls {
+                do {
+                    let mount = try MountStore.shared.add(url: url)
+                    toast = "已授权文件夹：\(mount.name)"
+                } catch {
+                    toast = "文件夹没授权上：\(error.localizedDescription)"
+                }
+            }
+            mountsVersion += 1
+            return
+        }
+        for url in urls { addAttachment(from: url) }
+    }
+
+    /// 把外部选中的文件读进来（带安全作用域访问 + iCloud 下载兜底）。
+    func addAttachment(from url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            var data = try Data(contentsOf: url)
+            if data.isEmpty {
+                try FileManager.default.startDownloadingUbiquitousItem(at: url)
+                data = try Data(contentsOf: url)
+            }
+            let type = UTType(filenameExtension: url.pathExtension)
+            let isImage = type?.conforms(to: .image) ?? false
+            let ref = try AttachmentStore.shared.save(data: data,
+                                                     fileName: url.lastPathComponent,
+                                                     mimeType: type?.preferredMIMEType ?? "application/octet-stream",
+                                                     kind: isImage ? .image : .file)
+            pendingAttachments.append(ref)
+            toast = "已加入 \(url.lastPathComponent)"
+        } catch {
+            toast = "文件没加上：\(error.localizedDescription)"
+        }
     }
 
     // MARK: - 会话操作
@@ -616,6 +686,13 @@ final class AppModel: ObservableObject {
     }
 
     private func systemPrompt(sessionID: UUID) -> String {
+        let base = basePrompt(sessionID: sessionID)
+        let override = systemPromptOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+        if override.isEmpty { return base }
+        return override + "\n\n" + base
+    }
+
+    private func basePrompt(sessionID: UUID) -> String {
         let isChat = sessions.first(where: { $0.id == sessionID })?.mode != .work
         if isChat {
             return """
@@ -653,7 +730,11 @@ final class AppModel: ObservableObject {
         - Documents 之外的沙盒路径、系统目录、别的 App 的私有目录通常会被 iOS 拒绝。真被拒绝时工具会返回「错误：…」，这时再告诉用户这个位置改不了，并建议在设置里用「添加外部文件夹」授权一个可写目录。不要拿「可能没权限」当理由提前拒绝干活。
         - 这台设备上没有 shell、没有 git、没有编译器，也不能起子进程 —— 这不是权限问题，是根本没有这种能力：要算东西用 run_js，要取网页用 fetch_url。
 
-        可用工具：list_dir / read_file / write_file / edit_file / make_dir / delete_path / move_path / copy_path / search_files / file_info / fetch_url / run_js / now。
+        可用工具：list_dir / read_file / write_file / edit_file / make_dir / delete_path / move_path / copy_path / search_files / file_info / fetch_url / run_js / now / open_url / app_config。
+
+        除了读写文件，你还能：
+        - open_url：在设备上打开网页或别的 App（https://…、shortcuts://、safari://、maps:// 等），用户说「帮我打开 X」就直接调。
+        - app_config：读取或修改这个 App 自己的设置 —— model（模型名）、effort（推理等级）、base_url（接口地址）、card_opacity（卡片不透明度）、max_rounds（轮数上限）、warn_before_run（开跑提醒）、system_prompt（系统提示词）。用户说「换个模型」「把界面调透一点」「以后回答简短点」这类要求，直接改设置，不要让用户自己去翻菜单。
 
         改文件先用 read_file 看原文，再用 edit_file 按原文替换；整篇重写才用 write_file。找不到东西就用 search_files 搜。
 

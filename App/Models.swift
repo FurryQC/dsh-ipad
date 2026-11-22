@@ -147,3 +147,11 @@ struct ToolSpec: Codable {
     var type: String = "function"
     var function: ToolSpecFunction
 }
+
+/// 系统选择器请求。统一由 RootView 在最外层弹，避免 sheet 里再弹 sheet 被吞掉。
+enum PickerRequest: String, Identifiable {
+    case files
+    case folders
+
+    var id: String { rawValue }
+}

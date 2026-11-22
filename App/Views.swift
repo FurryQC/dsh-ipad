@@ -77,6 +77,14 @@ struct RootView: View {
             } message: {
                 Text("iPadOS 会在 App 进入后台几十秒后挂起它，正在跑的请求会被切断。任务做完再切。")
             }
+            // 所有系统选择器都在这一层弹：sheet 里再弹 sheet 会被 iOS 静默吞掉。
+            .sheet(item: $model.pickerRequest) { request in
+                DocumentPicker(mode: request == .folders ? .folders : .files) { urls in
+                    model.pickerRequest = nil
+                    model.handlePicked(urls, folders: request == .folders)
+                }
+                .ignoresSafeArea()
+            }
 
             // 启动动画盖在最上层，自己跑完 1.66 秒后回调。下面这层透明蒙板拦住这期间的触摸。
             if showSplash {
@@ -1055,7 +1063,12 @@ struct AttachmentPanel: View {
                     panelButton("拍照", systemImage: "camera")
                 }
                 Button {
-                    showFiles = true
+                    // 先收起附件面板，再让 RootView 在最高层弹系统选择器。
+                    dismiss()
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        model.pickerRequest = .files
+                    }
                 } label: {
                     panelButton("文件", systemImage: "paperclip")
                 }
@@ -1413,7 +1426,8 @@ struct SettingsView: View {
                         UIPasteboard.general.string = Workspace.root.path
                     }
                     Button {
-                        showFolderPicker = true
+                        // 只走最高层弹窗：在设置页 sheet 里再弹一个 sheet 会被 iOS 吞掉。
+                        model.pickerRequest = .folders
                     } label: {
                         Label("添加外部文件夹", systemImage: "folder.badge.plus")
                     }
@@ -1447,6 +1461,18 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    TextEditor(text: $model.systemPromptOverride)
+                        .font(.system(size: 13))
+                        .frame(minHeight: 120)
+                        .scrollContentBackground(.hidden)
+                    Text("留空就用内置提示词。写完点右上角「保存」生效。也可以在对话里让 agent 用 app_config 改 system_prompt / model / effort / card_opacity 这些。")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textTertiary)
+                } header: {
+                    Text("Agent 能力")
+                }
+
+                Section {
                     Text("这是原生 iOS App：模型走 API，工具和文件都在这台设备上跑。iOS 不允许创建子进程，所以没有 shell —— 需要计算用 run_js，需要网页内容用 fetch_url。")
                         .font(.system(size: 13))
                         .foregroundColor(Theme.textSecondary)
@@ -1460,18 +1486,8 @@ struct SettingsView: View {
             .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear { mounts = MountStore.shared.mounts }
-            .sheet(isPresented: $showFolderPicker) {
-                DocumentPicker(mode: .folders) { urls in
-                    showFolderPicker = false
-                    guard let url = urls.first else { return }
-                    do {
-                        _ = try MountStore.shared.add(url: url)
-                        mounts = MountStore.shared.mounts
-                    } catch {
-                        mountError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-                    }
-                }
-                .ignoresSafeArea()
+            .onChange(of: model.mountsVersion) { _ in
+                mounts = MountStore.shared.mounts
             }
             .sheet(isPresented: $showWallpaperSheet) {
                 WallpaperPickerView()
@@ -1500,6 +1516,7 @@ struct SettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
+                        UserDefaults.standard.set(model.systemPromptOverride, forKey: AppModel.systemPromptKey)
                         if Keychain.saveAPIKey(model.apiKey) {
                             dismiss()
                         } else {

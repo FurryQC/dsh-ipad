@@ -1,5 +1,6 @@
 import Foundation
 import JavaScriptCore
+import UIKit
 
 enum ToolFailure: Error {
     case message(String)
@@ -202,6 +203,20 @@ enum Tools {
                 [:],
                 required: []
             ),
+            spec(
+                "open_url",
+                "在设备上打开一个网址或别的 App 的 URL scheme（例如 https://…、shortcuts://、safari://、maps://），会切到那个 App。",
+                ["url": ("string", "完整 URL，没有 scheme 时按 https:// 处理。")],
+                required: ["url"]
+            ),
+            spec(
+                "app_config",
+                "读取或修改这个 App 自己的设置（模型、推理等级、卡片不透明度、轮数上限、开跑前提醒、系统提示词）。action=get 列出当前值；action=set 需要 key 和 value。",
+                ["action": ("string", "get 或 set，默认 get。"),
+                 "key": ("string", "set 时的键：model / effort / base_url / card_opacity / max_rounds / warn_before_run / system_prompt。"),
+                 "value": ("string", "set 时的新值，统一按字符串传（布尔用 true/false）。")],
+                required: []
+            ),
         ]
     }
 
@@ -236,12 +251,106 @@ enum Tools {
             case "fetch_url":  return try await fetchURL(args)
             case "run_js":     return try runJS(args)
             case "now":        return nowString()
-            default:           return "错误：没有名为 \(name) 的工具。可用工具：list_dir, read_file, write_file, edit_file, make_dir, delete_path, move_path, copy_path, search_files, file_info, fetch_url, run_js, now"
+            case "open_url":   return try await openURL(args)
+            case "app_config": return try appConfig(args)
+            default:           return "错误：没有名为 \(name) 的工具。可用工具：list_dir, read_file, write_file, edit_file, make_dir, delete_path, move_path, copy_path, search_files, file_info, fetch_url, run_js, now, open_url, app_config"
             }
         } catch {
             let text = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             return "错误：" + text
         }
+    }
+
+    // MARK: - 打开别的 App / 改本 App 设置
+
+    /// AppModel 订阅这个通知，把 UserDefaults 里的新值同步回界面状态。
+    static let configChanged = Notification.Name("com.dsh.ipad.configChanged")
+
+    private static func openURL(_ args: [String: Any]) async throws -> String {
+        guard let raw = string(args, "url")?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            throw ToolFailure.message("open_url 需要 url 参数")
+        }
+        let normalized: String
+        if raw.contains("://") || raw.hasPrefix("mailto:") || raw.hasPrefix("tel:") {
+            normalized = raw
+        } else {
+            normalized = "https://" + raw
+        }
+        guard let url = URL(string: normalized) else {
+            throw ToolFailure.message("不是合法的 URL：\(raw)")
+        }
+        // UIApplication.open 只能在主线程调，回调也在主线程。
+        let opened: Bool = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.main.async {
+                UIApplication.shared.open(url, options: [:]) { ok in cont.resume(returning: ok) }
+            }
+        }
+        if opened { return "已经用系统打开 \(normalized)" }
+        throw ToolFailure.message("系统打不开 \(normalized) —— 可能这台设备没装对应的 App，或者 scheme 不对。")
+    }
+
+    private static func appConfig(_ args: [String: Any]) throws -> String {
+        let defaults = UserDefaults.standard
+        let action = (string(args, "action") ?? "get").lowercased()
+        let rows: [(String, String, String)] = [
+            ("model", "dsh.model", "模型名，例如 deepseek-flash"),
+            ("effort", "dsh.effort", "推理等级 off / low / high / max"),
+            ("base_url", "dsh.baseURL", "接口地址，默认 https://api.deepseek.com/anthropic"),
+            ("card_opacity", "dsh.cardOpacity", "卡片不透明度 0.25 ~ 1.0"),
+            ("max_rounds", "dsh.maxRounds", "一次任务最多几轮工具 4 ~ 80"),
+            ("warn_before_run", "dsh.warnBeforeRun", "开跑前是否提醒别切走 true / false"),
+            ("system_prompt", "dsh.systemPromptOverride", "自定义系统提示词，空字符串表示用内置的"),
+        ]
+        if action == "get" {
+            var lines = ["这个 App 的当前设置："]
+            for (name, key, description) in rows {
+                let value = defaults.object(forKey: key).map { String(describing: $0) } ?? "（还没设置，用默认值）"
+                lines.append("- \(name) = \(value)    # \(description)")
+            }
+            return lines.joined(separator: "\n")
+        }
+        guard action == "set" else {
+            throw ToolFailure.message("app_config 的 action 只能是 get 或 set")
+        }
+        guard let key = string(args, "key")?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
+            throw ToolFailure.message("set 需要 key 参数")
+        }
+        guard let value = string(args, "value") else {
+            throw ToolFailure.message("set 需要 value 参数")
+        }
+        guard let row = rows.first(where: { $0.0 == key }) else {
+            throw ToolFailure.message("没有这个设置项：\(key)。可用的是：" + rows.map { $0.0 }.joined(separator: ", "))
+        }
+        switch key {
+        case "model", "base_url":
+            defaults.set(value, forKey: row.1)
+        case "effort":
+            let lowered = value.lowercased()
+            guard ["off", "low", "high", "max"].contains(lowered) else {
+                throw ToolFailure.message("effort 只能是 off / low / high / max")
+            }
+            defaults.set(lowered, forKey: row.1)
+        case "card_opacity":
+            guard let number = Double(value), number >= 0.25, number <= 1.0 else {
+                throw ToolFailure.message("card_opacity 要 0.25 到 1.0 之间的数字")
+            }
+            defaults.set(number, forKey: row.1)
+        case "max_rounds":
+            guard let number = Int(value), number >= 4, number <= 80 else {
+                throw ToolFailure.message("max_rounds 要 4 到 80 之间的整数")
+            }
+            defaults.set(number, forKey: row.1)
+        case "warn_before_run":
+            let lowered = value.lowercased()
+            guard lowered == "true" || lowered == "false" else {
+                throw ToolFailure.message("warn_before_run 用 true 或 false")
+            }
+            defaults.set(lowered == "true", forKey: row.1)
+        default:
+            defaults.set(value, forKey: row.1)
+        }
+        NotificationCenter.default.post(name: configChanged, object: nil)
+        return "已改：\(key) = \(value)。界面会自动刷新，下一轮对话生效。"
     }
 
     // MARK: - 参数
