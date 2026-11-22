@@ -26,24 +26,44 @@ struct Workspace {
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: nil)
     }
 
+    /// 把 URL 变回模型看得懂的路径：工作目录里是相对路径，外部授权目录是 `mount:名字/子路径`。
     static func relativePath(of url: URL) -> String {
-        let base = root.standardizedFileURL.path
         let path = url.standardizedFileURL.path
-        guard path.hasPrefix(base) else { return url.lastPathComponent }
-        var relative = String(path.dropFirst(base.count))
-        if relative.hasPrefix("/") { relative.removeFirst() }
-        return relative.isEmpty ? "." : relative
+        let base = root.standardizedFileURL.path
+        if path == base { return "." }
+        if path.hasPrefix(base + "/") {
+            var relative = String(path.dropFirst(base.count))
+            if relative.hasPrefix("/") { relative.removeFirst() }
+            return relative
+        }
+        for mount in MountStore.shared.mounts {
+            guard let mountURL = try? MountStore.shared.resolve(name: mount.name) else { continue }
+            let mountPath = mountURL.standardizedFileURL.path
+            if path == mountPath { return "mount:" + mount.name }
+            if path.hasPrefix(mountPath + "/") {
+                var relative = String(path.dropFirst(mountPath.count))
+                if relative.hasPrefix("/") { relative.removeFirst() }
+                return "mount:" + mount.name + "/" + relative
+            }
+        }
+        return url.lastPathComponent
     }
 
-    /// 把模型给的相对路径解析到工作目录内；越界直接拒绝。
+    /// 把模型给的路径解析成 URL。
+    ///
+    /// `mount:<名字>/...` 走用户授权过的外部目录；其余一律相对工作目录，
+    /// 两条路都做前缀校验，`..` 一律拒绝。
     static func resolve(_ raw: String) throws -> URL {
         var path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if path.isEmpty || path == "." || path == "./" { return root }
+        if path.hasPrefix("mount:") {
+            return try resolveInMount(String(path.dropFirst("mount:".count)))
+        }
 
         while path.hasPrefix("/") { path.removeFirst() }
         let parts = path.split(separator: "/").map(String.init)
         if parts.contains("..") {
-            throw ToolFailure.message("路径里不能包含 ..，所有操作只能在工作目录内进行")
+            throw ToolFailure.message("路径里不能包含 ..，所有操作只能在工作目录或已授权的挂载目录里进行")
         }
 
         var url = root
@@ -56,6 +76,33 @@ struct Workspace {
         let target = resolved.path
         guard target == base || target.hasPrefix(base + "/") else {
             throw ToolFailure.message("路径越界：\(raw)")
+        }
+        return resolved
+    }
+
+    private static func resolveInMount(_ rest: String) throws -> URL {
+        var text = rest
+        while text.hasPrefix("/") { text.removeFirst() }
+        guard !text.isEmpty else {
+            throw ToolFailure.message("mount: 后面要跟目录名，例如 mount:下载/清单.txt")
+        }
+        let parts = text.split(separator: "/").map(String.init)
+        if parts.contains("..") {
+            throw ToolFailure.message("路径里不能包含 ..")
+        }
+        guard let name = parts.first, !name.isEmpty else {
+            throw ToolFailure.message("mount: 后面要跟目录名")
+        }
+        let baseURL = try MountStore.shared.resolve(name: name)
+        var url = baseURL
+        for part in parts.dropFirst() where !part.isEmpty && part != "." {
+            url.appendPathComponent(part, isDirectory: false)
+        }
+        let resolved = url.standardizedFileURL
+        let base = baseURL.standardizedFileURL.path
+        let target = resolved.path
+        guard target == base || target.hasPrefix(base + "/") else {
+            throw ToolFailure.message("路径越界：mount:\(rest)")
         }
         return resolved
     }
@@ -108,6 +155,36 @@ enum Tools {
                 required: ["from", "to"]
             ),
             spec(
+                "edit_file",
+                "把文件里的一段文本替换成新文本（和桌面端的编辑工具一样按原文匹配，不重写整个文件）。",
+                ["path": ("string", "文件路径。"),
+                 "old_text": ("string", "要被替换掉的原文本，必须和文件里一模一样（含缩进）。"),
+                 "new_text": ("string", "替换成的新文本，空字符串表示删除这段。"),
+                 "replace_all": ("boolean", "这段文本出现多次时是否全部替换，默认 false（出现多次会报错让你给更长上下文）。")],
+                required: ["path", "old_text", "new_text"]
+            ),
+            spec(
+                "search_files",
+                "在目录里按正则搜索文本，返回命中的 路径:行号: 那一行。用来在一个项目里找代码或找文件。",
+                ["pattern": ("string", "正则表达式，例如 TODO 或 func\\s+main。"),
+                 "path": ("string", "从哪个目录开始搜，省略表示工作目录根。"),
+                 "max_results": ("integer", "最多返回多少条，默认 50。")],
+                required: ["pattern"]
+            ),
+            spec(
+                "file_info",
+                "查一个路径是否存在、是文件还是目录、多大、什么时候改的。",
+                ["path": ("string", "要查的路径。")],
+                required: ["path"]
+            ),
+            spec(
+                "copy_path",
+                "复制文件或目录（源不动）。",
+                ["from": ("string", "源路径。"),
+                 "to": ("string", "目标路径。")],
+                required: ["from", "to"]
+            ),
+            spec(
                 "fetch_url",
                 "抓取一个 http/https 网址，返回正文文本（HTML 会去掉标签）。",
                 ["url": ("string", "完整网址，必须带 http:// 或 https://。")],
@@ -152,10 +229,14 @@ enum Tools {
             case "make_dir":   return try makeDir(args)
             case "delete_path": return try deletePath(args)
             case "move_path":  return try movePath(args)
+            case "edit_file":  return try editFile(args)
+            case "search_files": return try searchFiles(args)
+            case "file_info":  return try fileInfo(args)
+            case "copy_path":  return try copyPath(args)
             case "fetch_url":  return try await fetchURL(args)
             case "run_js":     return try runJS(args)
             case "now":        return nowString()
-            default:           return "错误：没有名为 \(name) 的工具。可用工具：list_dir, read_file, write_file, make_dir, delete_path, move_path, fetch_url, run_js, now"
+            default:           return "错误：没有名为 \(name) 的工具。可用工具：list_dir, read_file, write_file, edit_file, make_dir, delete_path, move_path, copy_path, search_files, file_info, fetch_url, run_js, now"
             }
         } catch {
             let text = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -304,6 +385,149 @@ enum Tools {
         )
         try FileManager.default.moveItem(at: source, to: target)
         return "已移动 \(from) → \(to)"
+    }
+
+    /// 按原文替换：和桌面端的编辑工具同一套语义（默认要求唯一匹配）。
+    private static func editFile(_ args: [String: Any]) throws -> String {
+        let path = try string(args, "path")
+        let oldText = try string(args, "old_text")
+        let newText = try string(args, "new_text", fallback: "")
+        let replaceAll = (args["replace_all"] as? Bool) ?? false
+
+        guard !oldText.isEmpty else {
+            throw ToolFailure.message("old_text 不能为空，没法定位要改哪一段")
+        }
+        let url = try Workspace.resolve(path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw ToolFailure.message("没有这个文件：\(path)")
+        }
+        let data = try Data(contentsOf: url)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ToolFailure.message("这是二进制文件，不能按文本改：\(path)")
+        }
+        let occurrences = text.components(separatedBy: oldText).count - 1
+        if occurrences == 0 {
+            throw ToolFailure.message("文件里没有这段原文，什么都没改：\(path)。先用 read_file 看一眼现在的实际内容。")
+        }
+        if occurrences > 1 && !replaceAll {
+            throw ToolFailure.message("这段原文在 \(path) 里出现了 \(occurrences) 次，不知道该改哪一处。给更长的上下文，或者把 replace_all 设成 true。")
+        }
+
+        let updated: String
+        if replaceAll {
+            updated = text.replacingOccurrences(of: oldText, with: newText)
+        } else if let range = text.range(of: oldText) {
+            updated = text.replacingCharacters(in: range, with: newText)
+        } else {
+            updated = text
+        }
+        guard let out = updated.data(using: .utf8) else {
+            throw ToolFailure.message("改完的内容没法编码成 UTF-8")
+        }
+        try out.write(to: url, options: .atomic)
+        let changed = replaceAll ? occurrences : 1
+        return "已修改 \(Workspace.relativePath(of: url))（替换 \(changed) 处，现在 \(out.count) 字节）"
+    }
+
+    /// 按正则搜目录里的文本行。跳过隐藏文件、二进制和超大文件。
+    private static func searchFiles(_ args: [String: Any]) throws -> String {
+        let pattern = try string(args, "pattern")
+        let path = try string(args, "path", fallback: ".")
+        let maxResults = max(1, intValue(args, "max_results", fallback: 50))
+
+        let regex: NSRegularExpression
+        do {
+            regex = try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+        } catch {
+            throw ToolFailure.message("正则写得不对：\(error.localizedDescription)")
+        }
+
+        let start = try Workspace.resolve(path)
+        guard FileManager.default.fileExists(atPath: start.path) else {
+            throw ToolFailure.message("没有这个路径：\(path)")
+        }
+
+        var hits: [String] = []
+        var scanned = 0
+        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey]
+        let manager = FileManager.default
+
+        func scan(_ file: URL) {
+            guard hits.count < maxResults else { return }
+            let values = try? file.resourceValues(forKeys: Set(keys))
+            if values?.isDirectory == true {
+                let children = (try? manager.contentsOfDirectory(at: file,
+                                                                 includingPropertiesForKeys: keys,
+                                                                 options: [.skipsHiddenFiles])) ?? []
+                for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                    scan(child)
+                }
+                return
+            }
+            if (values?.fileSize ?? 0) > 1_500_000 { return }
+            guard let data = try? Data(contentsOf: file),
+                  let text = String(data: data, encoding: .utf8) else { return }
+            scanned += 1
+            let display = Workspace.relativePath(of: file)
+            let lines = text.components(separatedBy: "\n")
+            for (index, line) in lines.enumerated() {
+                if hits.count >= maxResults { return }
+                let range = NSRange(line.startIndex..<line.endIndex, in: line)
+                if regex.firstMatch(in: line, options: [], range: range) != nil {
+                    hits.append("\(display):\(index + 1): \(line.trimmingCharacters(in: .whitespaces))")
+                }
+            }
+        }
+
+        scan(start)
+        if hits.isEmpty {
+            return "没有匹配 \(pattern)（扫了 \(scanned) 个文本文件）"
+        }
+        let tail = hits.count >= maxResults ? "\n…（到上限 \(maxResults) 条了，可能还有更多）" : ""
+        return "匹配 \(hits.count) 条（扫了 \(scanned) 个文本文件）\n" + hits.joined(separator: "\n") + tail
+    }
+
+    private static func fileInfo(_ args: [String: Any]) throws -> String {
+        let path = try string(args, "path")
+        let url = try Workspace.resolve(path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return "\(path) 不存在"
+        }
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey])
+        let isDirectory = values?.isDirectory ?? false
+        var lines = ["路径：\(Workspace.relativePath(of: url))", "类型：\(isDirectory ? "目录" : "文件")"]
+        if !isDirectory, let size = values?.fileSize {
+            lines.append("大小：\(size) 字节")
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        formatter.timeZone = TimeZone.current
+        if let modified = values?.contentModificationDate {
+            lines.append("修改时间：\(formatter.string(from: modified))")
+        }
+        if let created = values?.creationDate {
+            lines.append("创建时间：\(formatter.string(from: created))")
+        }
+        if isDirectory {
+            let children = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+            lines.append("直接子项：\(children.count) 个")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func copyPath(_ args: [String: Any]) throws -> String {
+        let from = try string(args, "from")
+        let to = try string(args, "to")
+        let source = try Workspace.resolve(from)
+        let target = try Workspace.resolve(to)
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw ToolFailure.message("没有这个路径：\(from)")
+        }
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true,
+                                                attributes: nil)
+        try FileManager.default.copyItem(at: source, to: target)
+        return "已复制 \(from) → \(to)"
     }
 
     private static func fetchURL(_ args: [String: Any]) async throws -> String {
