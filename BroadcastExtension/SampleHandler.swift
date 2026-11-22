@@ -17,32 +17,35 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var announcedFirstWrite = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
-        let config = WatchShared.load()
+        // 配置优先读容器里的文件（能读回来几条信息全写进错误弹窗，别让人猜）。
+        let loaded = WatchShared.loadConfigDetailed()
+        let config = loaded.config
         let groupOK = WatchShared.groupAvailable
         WatchShared.updateDiag { diag in
             diag.groupOK = groupOK
             diag.configEnabled = config.enabled
             diag.frames = 0
             diag.sent = 0
-            diag.lastError = config.enabled ? "广播已启动，等第一帧" : "扩展起来了但配置读到的是「未启用」"
+            diag.lastError = config.enabled ? "广播已启动，等第一帧" : "扩展起来了但配置读到的是「未启用」（来源 \(loaded.source)）"
         }
 
         // 这两条错误会由系统弹给用户，是「扩展到底跑没跑起来 / 能不能读到配置」最直接的证据：
         // 弹出来说明扩展活了；连弹窗都没有说明扩展根本没被系统拉起（重签时 appex 没签好）。
+        let containerInfo = WatchShared.containerDiagnostics()
         if !groupOK {
             finishBroadcastWithError(Self.watchError(
-                "扩展已启动，但拿不到 App Group（group.com.dsh.qc）。重签时请把 group.com.dsh.qc 同时加到 com.dsh.qc 和 com.dsh.qc.broadcast。"
+                "扩展已启动，但拿不到 App Group（group.com.dsh.qc）。扩展这边：\(containerInfo)。重签时请把 group.com.dsh.qc 同时加到 com.dsh.qc 和 com.dsh.qc.broadcast。"
             ))
             return
         }
         if !config.enabled {
             finishBroadcastWithError(Self.watchError(
-                "扩展已启动、共享容器正常，但配置读到的是「未启用」。回 App 的屏幕识别页点一次「保存配置」，再回来开始广播。"
+                "扩展已启动，容器可用，但读到的配置是「未启用」。扩展读到的：\(loaded.detail)；容器：\(containerInfo)。回 App 的屏幕识别页点一次「保存配置」再试；如果这里显示来源 none 或文件不存在，说明主 App 和扩展没共享同一个容器。"
             ))
             return
         }
 
-        Self.notifyNow("DSH 屏幕识别 · 扩展已启动", "共享容器可用；配置已启用，等第一帧画面。")
+        Self.notifyNow("DSH 屏幕识别 · 扩展已启动", "配置来源 \(loaded.source)；容器可用，等第一帧画面。")
     }
 
     private static func watchError(_ message: String) -> NSError {
@@ -60,7 +63,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard sampleBufferType == .video else { return }
 
         frameCount += 1
-        let config = WatchShared.load()
+        let config = WatchShared.loadConfigDetailed().config
         writeDiagIfNeeded(config: config)
 
         if frameCount == 1 && !announcedFirstFrame {
