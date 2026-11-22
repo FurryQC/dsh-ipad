@@ -79,7 +79,7 @@ final class AppModel: ObservableObject {
         maxRounds = rounds > 0 ? rounds : 24
         warnBeforeRun = defaults.object(forKey: Keys.warnBeforeRun) as? Bool ?? true
         apiKey = Keychain.loadAPIKey()
-        let first = ChatSession()
+        let first = ChatSession(title: SessionMode.chat.title, mode: .chat)
         sessions = [first]
         currentSessionID = first.id
         Workspace.prepare()
@@ -98,11 +98,28 @@ final class AppModel: ObservableObject {
     }
 
     func newSession() {
+        newSession(mode: .chat)
+    }
+
+    /// 新建会话。对话模式不加载工具、不弹「别切走」；工作模式才允许改文件。
+    func newSession(mode: SessionMode) {
         guard !isRunning else { return }
-        let session = ChatSession()
+        let session = ChatSession(title: mode.title, mode: mode)
         sessions.insert(session, at: 0)
         currentSessionID = session.id
         save()
+    }
+
+    /// 切换当前会话的模式。运行中不改，免得同一轮里规则前后不一致。
+    func setMode(_ mode: SessionMode) {
+        guard !isRunning else { return }
+        mutate(currentSessionID) { session in
+            guard session.mode != mode else { return }
+            session.mode = mode
+            if session.title == SessionMode.chat.title || session.title == SessionMode.work.title {
+                session.title = mode.title
+            }
+        }
     }
 
     func select(_ id: UUID) {
@@ -139,7 +156,7 @@ final class AppModel: ObservableObject {
             errorText = problem
             return
         }
-        if warnBeforeRun && !warnedThisLaunch {
+        if currentSession?.mode == .work, warnBeforeRun, !warnedThisLaunch {
             pendingPrompt = text
             showSwitchWarning = true
             return
@@ -222,7 +239,7 @@ final class AppModel: ObservableObject {
 
         while isRunning, runID == myID, round < maxRounds {
             round += 1
-            statusLine = "第 \(round) 轮：正在思考…"
+            statusLine = currentSession?.mode == .chat ? "正在回答…" : "第 \(round) 轮：正在思考…"
             streamPreview = ""
             reasoningPreview = ""
 
@@ -323,11 +340,11 @@ final class AppModel: ObservableObject {
         }
         let options = MessagesAPI.RequestOptions(
             model: model,
-            system: systemPrompt(),
+            system: systemPrompt(sessionID: sessionID),
             effort: reasoningEffort,
             maxTokens: 8192,
             messages: wireMessages(sessionID: sessionID),
-            tools: wireTools()
+            tools: wireTools(sessionID: sessionID)
         )
         guard let payload = MessagesAPI.body(options) else {
             throw MessagesAPI.Failure(message: "请求体无法编码成 JSON。")
@@ -410,8 +427,10 @@ final class AppModel: ObservableObject {
         return await Tools.execute(name: name, arguments: arguments)
     }
 
-    private func wireTools() -> [[String: Any]] {
-        (Tools.specs + PluginHost.shared.toolSpecs()).map { spec in
+    private func wireTools(sessionID: UUID) -> [[String: Any]] {
+        // 对话模式一个工具都不给：模型拿不到工具就没法动文件，也不会长出长循环。
+        guard sessions.first(where: { $0.id == sessionID })?.mode != .chat else { return [] }
+        return (Tools.specs + PluginHost.shared.toolSpecs()).map { spec in
             var properties: [String: Any] = [:]
             for (key, value) in spec.function.parameters.properties {
                 properties[key] = ["type": value.type, "description": value.description]
@@ -496,8 +515,22 @@ final class AppModel: ObservableObject {
         return messages
     }
 
-    private func systemPrompt() -> String {
-        """
+    private func systemPrompt(sessionID: UUID) -> String {
+        let isChat = sessions.first(where: { $0.id == sessionID })?.mode != .work
+        if isChat {
+            return """
+            你是运行在 iPad 上的 DeepSeek Harness 客户端里的助手，当前这个会话是「对话」模式。
+
+            对话模式没有工具：你看不到这台设备上的文件，也没有 shell，不能执行任何命令。需要时直接说明你做不到，不要假装调用过工具。
+
+            行为准则：
+            - 回答用中文，直接给结论，不要客套。
+            - 需要查资料就说明你知道什么、不确定什么。
+
+            当前时间：\(nowString())
+            """
+        }
+        return """
         你是运行在 iPad 上的 DeepSeek Harness 客户端里的助手。模型调用走 DeepSeek API，工具和文件都在本机执行。
 
         环境限制（不要假装能绕过）：
