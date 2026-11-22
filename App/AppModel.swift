@@ -157,28 +157,6 @@ final class AppModel: ObservableObject {
         mutate(currentSessionID) { $0.items = [] }
     }
 
-    // MARK: - 消息操作（长按菜单与「修改」用）
-
-    /// 长按「修改」时把输入框填回这条消息的内容。返回 nil 表示当前不能改（正在跑）。
-    func takeBackPrompt(_ id: UUID) -> String? {
-        guard !isRunning, let session = currentSession else { return nil }
-        guard let index = session.items.firstIndex(where: { $0.id == id }) else { return nil }
-        let text = session.items[index].text
-        mutate(currentSessionID) { $0.items.removeSubrange(index...) }
-        return text
-    }
-
-    /// 「重新生成」：删掉最后一条用户消息之后的所有内容，带上同样的附件重跑。
-    func regenerateLastReply() {
-        guard !isRunning, let session = currentSession else { return }
-        guard let index = session.items.lastIndex(where: { $0.role == .user }) else { return }
-        let prompt = session.items[index].text
-        let attachments = session.items[index].attachments
-        mutate(currentSessionID) { $0.items.removeSubrange(index...) }
-        queuedAttachments = attachments
-        startRun(prompt: prompt, appendUserMessage: true)
-    }
-
     // MARK: - 发送与任务循环
 
     func send(_ prompt: String) {
