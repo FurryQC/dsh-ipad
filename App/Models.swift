@@ -13,6 +13,34 @@ enum ChatRole: String, Codable {
     case tool
 }
 
+/// 会话的两种用途。对话模式不加载任何工具，也不会弹「别切走」；
+/// 工作模式才会读写文件、跑长任务，所以需要提醒用户留在本 App。
+enum SessionMode: String, Codable {
+    case chat
+    case work
+
+    var title: String {
+        switch self {
+        case .chat: return "对话"
+        case .work: return "工作"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .chat: return "bubble.left.and.bubble.right"
+        case .work: return "hammer"
+        }
+    }
+
+    var blurb: String {
+        switch self {
+        case .chat: return "只聊天，不带工具，不碰文件，也不会打断你切程序"
+        case .work: return "可以读写工作目录里的文件、跑工具循环，跑起来要留在本 App"
+        }
+    }
+}
+
 /// 会话里的一条消息。user/assistant 是对话，tool 是工具结果回填。
 struct ChatItem: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
@@ -30,10 +58,38 @@ struct ChatItem: Identifiable, Codable, Hashable {
 }
 
 struct ChatSession: Identifiable, Codable {
-    var id: UUID = UUID()
-    var title: String = "新会话"
-    var items: [ChatItem] = []
-    var updatedAt: Date = Date()
+    var id: UUID
+    var title: String
+    var mode: SessionMode
+    var items: [ChatItem]
+    var updatedAt: Date
+
+    init(id: UUID = UUID(),
+         title: String = "新对话",
+         mode: SessionMode = .chat,
+         items: [ChatItem] = [],
+         updatedAt: Date = Date()) {
+        self.id = id
+        self.title = title
+        self.mode = mode
+        self.items = items
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, mode, items, updatedAt
+    }
+
+    /// 手写解码：旧版本会话文件里没有 mode 字段，缺了就按「工作」读回，
+    /// 让已经在跑的老会话行为不变，而不是让整份历史解码失败。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? "新对话"
+        mode = try container.decodeIfPresent(SessionMode.self, forKey: .mode) ?? .work
+        items = try container.decodeIfPresent([ChatItem].self, forKey: .items) ?? []
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
+    }
 }
 
 // MARK: - API 传输结构
