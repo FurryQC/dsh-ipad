@@ -79,7 +79,7 @@ final class AppModel: ObservableObject {
         maxRounds = rounds > 0 ? rounds : 24
         warnBeforeRun = defaults.object(forKey: Keys.warnBeforeRun) as? Bool ?? true
         apiKey = Keychain.loadAPIKey()
-        let first = ChatSession(title: SessionMode.chat.title, mode: .chat)
+        let first = ChatSession(title: SessionMode.work.title, mode: .work)
         sessions = [first]
         currentSessionID = first.id
         Workspace.prepare()
@@ -98,7 +98,7 @@ final class AppModel: ObservableObject {
     }
 
     func newSession() {
-        newSession(mode: .chat)
+        newSession(mode: .work)
     }
 
     /// 新建会话。对话模式不加载工具、不弹「别切走」；工作模式才允许改文件。
@@ -521,7 +521,7 @@ final class AppModel: ObservableObject {
             return """
             你是运行在 iPad 上的 DeepSeek Harness 客户端里的助手，当前这个会话是「对话」模式。
 
-            对话模式没有工具：你看不到这台设备上的文件，也没有 shell，不能执行任何命令。需要时直接说明你做不到，不要假装调用过工具。
+            对话模式没有工具：你看不到这台设备上的文件，也没有 shell，不能执行任何命令。需要时直接说明你做不到，不要假装调用过工具。用户要你改文件或看文件时，提醒他把会话切到「工作」模式（顶部模式胶囊）。
 
             行为准则：
             - 回答用中文，直接给结论，不要客套。
@@ -530,15 +530,25 @@ final class AppModel: ObservableObject {
             当前时间：\(nowString())
             """
         }
+        let mountNames = MountStore.shared.mounts.map { $0.name }
+        let mountLine: String
+        if mountNames.isEmpty {
+            mountLine = "- 除了工作目录，还可以访问用户在设置里手动授权的外部文件夹（现在还没授权任何文件夹）。"
+        } else {
+            mountLine = "- 已授权的外部文件夹：" + mountNames.joined(separator: "、") + "，用 `mount:<名字>/子路径` 访问，例如 mount:" + (mountNames.first ?? "名字") + "/清单.txt。"
+        }
         return """
         你是运行在 iPad 上的 DeepSeek Harness 客户端里的助手。模型调用走 DeepSeek API，工具和文件都在本机执行。
 
         环境限制（不要假装能绕过）：
-        - 这是 iOS App，没有 shell、没有 git、没有编译器，不能 fork 进程。
-        - 所有文件操作只能在工作目录内，路径相对工作目录。
+        - 这是 iOS App，没有 shell、没有 git、没有编译器，不能 fork 进程，也不能读写系统目录或别的 App 的私有数据。
+        - 文件路径相对工作目录（Documents/workspace），也可以用 mount:<名字>/... 访问用户在设置里授权的文件夹。
+        \(mountLine)
         - 需要计算或脚本时用 run_js；需要取网页内容时用 fetch_url。
 
-        可用工具：list_dir / read_file / write_file / make_dir / delete_path / move_path / fetch_url / run_js / now。
+        可用工具：list_dir / read_file / write_file / edit_file / make_dir / delete_path / move_path / copy_path / search_files / file_info / fetch_url / run_js / now。
+
+        改文件先用 read_file 看原文，再用 edit_file 按原文替换；整篇重写才用 write_file。找不到东西就用 search_files 搜。
 
         行为准则：
         - 回答用中文，直接给结论和步骤，不要客套。
