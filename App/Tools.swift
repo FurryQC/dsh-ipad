@@ -267,7 +267,8 @@ enum Tools {
     static let configChanged = Notification.Name("com.dsh.ipad.configChanged")
 
     private static func openURL(_ args: [String: Any]) async throws -> String {
-        guard let raw = string(args, "url")?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+        let raw = try string(args, "url").trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty {
             throw ToolFailure.message("open_url 需要 url 参数")
         }
         let normalized: String
@@ -291,7 +292,7 @@ enum Tools {
 
     private static func appConfig(_ args: [String: Any]) throws -> String {
         let defaults = UserDefaults.standard
-        let action = (string(args, "action") ?? "get").lowercased()
+        let action = try string(args, "action", fallback: "get").lowercased()
         let rows: [(String, String, String)] = [
             ("model", "dsh.model", "模型名，例如 deepseek-flash"),
             ("effort", "dsh.effort", "推理等级 off / low / high / max"),
@@ -312,12 +313,11 @@ enum Tools {
         guard action == "set" else {
             throw ToolFailure.message("app_config 的 action 只能是 get 或 set")
         }
-        guard let key = string(args, "key")?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
+        let key = try string(args, "key").trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.isEmpty {
             throw ToolFailure.message("set 需要 key 参数")
         }
-        guard let value = string(args, "value") else {
-            throw ToolFailure.message("set 需要 value 参数")
-        }
+        let value = try string(args, "value")
         guard let row = rows.first(where: { $0.0 == key }) else {
             throw ToolFailure.message("没有这个设置项：\(key)。可用的是：" + rows.map { $0.0 }.joined(separator: ", "))
         }
