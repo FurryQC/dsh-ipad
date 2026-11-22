@@ -14,15 +14,19 @@ targets:
       - path: App
         excludes:
           - Info.plist
+          - DSH.entitlements
+      - path: Shared
+    dependencies:
+      - target: DSHBroadcast
     # 不用 XcodeGen 的 info: 块：它会重写 Info.plist，等于把 plist 复制成两份。
     # 这里只通过 INFOPLIST_FILE 指向仓库里那份，保持单一来源。
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc
         PRODUCT_NAME: DSH
-        # 版本名由用户指定（每轮交付前问一次）。b20 = 第 20 个构建。
-        MARKETING_VERSION: "b20"
-        CURRENT_PROJECT_VERSION: "20"
+        # 版本名由用户指定（每轮交付前问一次）。b21 = 第 21 个构建。
+        MARKETING_VERSION: "b21"
+        CURRENT_PROJECT_VERSION: "21"
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
@@ -34,6 +38,31 @@ targets:
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
         INFOPLIST_FILE: App/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
+        # App Group 供主 App 与广播扩展共享配置；用户重签时必须在签名工具里补上同一个组。
+        CODE_SIGN_ENTITLEMENTS: App/DSH.entitlements
+
+  DSHBroadcast:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: BroadcastExtension
+        excludes:
+          - Info.plist
+          - Broadcast.entitlements
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc.broadcast
+        PRODUCT_NAME: DSHBroadcast
+        MARKETING_VERSION: "b21"
+        CURRENT_PROJECT_VERSION: "21"
+        SWIFT_VERSION: "5.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        INFOPLIST_FILE: BroadcastExtension/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+        ENABLE_BITCODE: "NO"
+        CODE_SIGN_ENTITLEMENTS: BroadcastExtension/Broadcast.entitlements
 
 schemes:
   DSH:

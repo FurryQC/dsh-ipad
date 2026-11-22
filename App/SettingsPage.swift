@@ -10,6 +10,7 @@ struct SettingsPage: View {
     @State private var showKey = false
     @State private var showWallpaper = false
     @State private var showPlugins = false
+    @State private var showWatch = false
     @State private var mounts: [MountedFolder] = []
     @State private var keyError: String?
     @State private var savedHint = false
@@ -53,6 +54,9 @@ struct SettingsPage: View {
             NavigationView {
                 PluginListView(host: PluginHost.shared)
             }
+        }
+        .sheet(isPresented: $showWatch) {
+            WatchView()
         }
         .alert("API key 没存上", isPresented: Binding(get: { keyError != nil }, set: { if !$0 { keyError = nil } })) {
             Button("知道了", role: .cancel) { keyError = nil }
@@ -252,6 +256,15 @@ struct SettingsPage: View {
                         showPlugins = true
                     } label: {
                         SettingsNavRow(title: "插件", detail: "\(PluginHost.shared.plugins.count) 个 .js 插件")
+                    }
+                    .buttonStyle(.plain)
+
+                    SettingsDivider()
+
+                    Button {
+                        showWatch = true
+                    } label: {
+                        SettingsNavRow(title: "屏幕识别", detail: "直播捕捉 · 每 N 秒识别一次")
                     }
                     .buttonStyle(.plain)
                 }
