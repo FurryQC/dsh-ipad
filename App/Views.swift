@@ -244,7 +244,7 @@ struct ChatCard: View {
         }
         .floatingPanel()
         .sheet(isPresented: $showSettings) {
-            SettingsView().environmentObject(model)
+            SettingsPage().environmentObject(model)
         }
         .sheet(isPresented: $showAttachPanel) {
             AttachmentPanel()
@@ -333,11 +333,30 @@ struct ChatCard: View {
             modelMenu
             effortMenu
             Spacer(minLength: 0)
+            tokenBadge
             iconButton("gearshape") { showSettings = true }
         }
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, 8)
+    }
+
+    /// 当前会话累计 token。数字大时缩成 12.3k，宽度不跳动。
+    private var tokenBadge: some View {
+        Text(tokenText)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(Theme.textTertiary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Capsule().fill(Color.white.opacity(0.06)))
+    }
+
+    private var tokenText: String {
+        let total = model.currentSession?.tokensTotal ?? 0
+        if total >= 10000 {
+            return String(format: "%.1fk tok", Double(total) / 1000)
+        }
+        return "\(total) tok"
     }
 
     private var modeMenu: some View {
@@ -397,14 +416,9 @@ struct ChatCard: View {
         }
     }
 
+    /// 推理等级直接显示协议里的原词（off/low/high/max），和 DSH 桌面版一致。
     private func effortLabel(_ effort: String) -> String {
-        switch effort {
-        case "off": return "推理关"
-        case "low": return "推理低"
-        case "high": return "推理高"
-        case "max": return "推理最高"
-        default: return effort
-        }
+        effort
     }
 
     private func chip(_ text: String, systemImage: String, highlighted: Bool) -> some View {

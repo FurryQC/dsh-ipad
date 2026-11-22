@@ -92,23 +92,33 @@ struct ChatSession: Identifiable, Codable {
     var updatedAt: Date
     /// 最近一次跑完工具的耗时。结果折叠行要显示「已完成，用时 X」，不落盘就只剩转圈。
     var lastRunSeconds: Double?
+    /// 这个会话累计消耗的 token（输入 / 输出分开记）。服务端每次都会回传 usage。
+    var tokensIn: Int = 0
+    var tokensOut: Int = 0
+
+    /// 顶栏显示的合计。
+    var tokensTotal: Int { tokensIn + tokensOut }
 
     init(id: UUID = UUID(),
          title: String = "新对话",
          mode: SessionMode = .chat,
          items: [ChatItem] = [],
          updatedAt: Date = Date(),
-         lastRunSeconds: Double? = nil) {
+         lastRunSeconds: Double? = nil,
+         tokensIn: Int = 0,
+         tokensOut: Int = 0) {
         self.id = id
         self.title = title
         self.mode = mode
         self.items = items
         self.updatedAt = updatedAt
         self.lastRunSeconds = lastRunSeconds
+        self.tokensIn = tokensIn
+        self.tokensOut = tokensOut
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, mode, items, updatedAt, lastRunSeconds
+        case id, title, mode, items, updatedAt, lastRunSeconds, tokensIn, tokensOut
     }
 
     /// 手写解码：旧版本会话文件里没有 mode 字段，缺了就按「工作」读回，
@@ -121,6 +131,8 @@ struct ChatSession: Identifiable, Codable {
         items = try container.decodeIfPresent([ChatItem].self, forKey: .items) ?? []
         updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? Date()
         lastRunSeconds = try container.decodeIfPresent(Double.self, forKey: .lastRunSeconds)
+        tokensIn = try container.decodeIfPresent(Int.self, forKey: .tokensIn) ?? 0
+        tokensOut = try container.decodeIfPresent(Int.self, forKey: .tokensOut) ?? 0
     }
 }
 

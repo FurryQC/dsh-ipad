@@ -65,6 +65,8 @@ final class AppModel: ObservableObject {
     @Published var pickerRequest: PickerRequest?
     /// 挂载列表变化时 +1，设置页据此重新读 MountStore。
     @Published var mountsVersion = 0
+    /// 全局累计 token（跨所有会话，落 UserDefaults）。设置页顶部显示。
+    @Published private(set) var totalTokens: Int = 0
 
     @Published var draftInjection: String?
     /// 一次性小提示（复制成功之类）。
@@ -90,6 +92,7 @@ final class AppModel: ObservableObject {
         static let maxRounds = "dsh.maxRounds"
         static let warnBeforeRun = "dsh.warnBeforeRun"
         static let cardOpacity = "dsh.cardOpacity"
+        static let totalTokens = "dsh.totalTokens"
     }
 
     // MARK: - 生命周期
@@ -111,6 +114,7 @@ final class AppModel: ObservableObject {
         Workspace.prepare()
         PluginHost.shared.reload()
         loadSessions()
+        totalTokens = defaults.integer(forKey: Keys.totalTokens)
         systemPromptOverride = UserDefaults.standard.string(forKey: AppModel.systemPromptKey) ?? ""
         NotificationCenter.default.addObserver(forName: Tools.configChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.reloadConfig() }
@@ -397,6 +401,7 @@ final class AppModel: ObservableObject {
             )
             appendItem(assistantItem, to: sessionID)
             streamPreview = ""
+            recordTokens(input: turn.inputTokens, output: turn.outputTokens, sessionID: sessionID)
 
             if turn.toolCalls.isEmpty {
                 finishedNaturally = true
@@ -841,8 +846,19 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func mutate(_ sessionID: UUID, _ body: (inout ChatSession) -> Void) {
-        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+    /// 把一轮请求的 usage 记到会话和全局。服务端偶尔回 0（比如流被中断），
+    /// 这种情况跳过，免得把已累计的数字清零。
+    private func recordTokens(input: Int, output: Int, sessionID: UUID) {
+        guard input > 0 || output > 0 else { return }
+        mutate(sessionID) {
+            $0.tokensIn += input
+            $0.tokensOut += output
+        }
+        totalTokens += input + output
+        UserDefaults.standard.set(totalTokens, forKey: Keys.totalTokens)
+    }
+
+    private func mutate(_ sessionID: UUID, _ body: (inout ChatSession) -> Void) {        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
         body(&sessions[index])
         sessions[index].updatedAt = Date()
         save()

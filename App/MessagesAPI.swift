@@ -13,6 +13,9 @@ enum MessagesAPI {
         var signature = ""
         var toolCalls: [ToolCall] = []
         var stopReason = ""
+        /// 服务端回传的 token 用量。message_start 给输入，message_delta 给最终输出。
+        var inputTokens = 0
+        var outputTokens = 0
     }
 
     /// 协议层失败，统一成给用户看的中文。tool 失败用 Tools 里的 ToolFailure，两者都接 LocalizedError。
@@ -161,9 +164,21 @@ enum MessagesAPI {
                     if arguments.isEmpty { arguments = "{}" }
                     turn.toolCalls.append(ToolCall(id: block.id, name: block.name, arguments: arguments))
                 }
+            case "message_start":
+                // 输入 token 只在 message_start 里给一次；后面 message_delta 只更输出。
+                if let message = event["message"] as? [String: Any],
+                   let usage = message["usage"] as? [String: Any] {
+                    if let value = usage["input_tokens"] as? Int { turn.inputTokens = value }
+                    if let value = usage["output_tokens"] as? Int { turn.outputTokens = value }
+                }
             case "message_delta":
                 if let delta = event["delta"] as? [String: Any], let reason = delta["stop_reason"] as? String {
                     turn.stopReason = reason
+                }
+                // 结束时的 usage 才是这一轮的最终输出数，覆盖 message_start 里的初值。
+                if let usage = event["usage"] as? [String: Any],
+                   let value = usage["output_tokens"] as? Int {
+                    turn.outputTokens = value
                 }
             case "message_stop":
                 return turn
