@@ -12,6 +12,8 @@ struct SettingsPage: View {
     @State private var showPlugins = false
     @State private var showWatch = false
     @State private var showImport = false
+    @State private var showCustomPrompt = false
+    @State private var customPrompt = ""
     @State private var mounts: [MountedFolder] = []
     @State private var keyError: String?
     @State private var savedHint = false
@@ -73,6 +75,21 @@ struct SettingsPage: View {
             Button("知道了", role: .cancel) { keyError = nil }
         } message: {
             Text(keyError ?? "")
+        }
+        .alert("自定义壁纸", isPresented: $showCustomPrompt) {
+            TextField("想要什么样子？比如「深空的星云，慢慢流动」", text: $customPrompt)
+            Button("取消", role: .cancel) { customPrompt = "" }
+            Button("开始生成") {
+                let prompt = customPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                customPrompt = ""
+                guard !prompt.isEmpty else { return }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 260_000_000)
+                    model.startCustomWallpaper(prompt: prompt)
+                }
+            }
+        } message: {
+            Text("会新开一个工作对话，让 AI 写一个单文件网页当壁纸；写完自动换上。")
         }
     }
 
@@ -239,6 +256,15 @@ struct SettingsPage: View {
         SettingsSection(title: "外观") {
             SettingsCard {
                 VStack(spacing: 0) {
+                    Button {
+                        showImport = true
+                    } label: {
+                        SettingsNavRow(title: "导入 DeepSeek 对话", detail: "从 App 导出的 .zip 导入")
+                    }
+                    .buttonStyle(.plain)
+
+                    SettingsDivider()
+
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("卡片不透明度").font(.system(size: 15)).foregroundColor(Theme.textPrimary)
@@ -273,9 +299,10 @@ struct SettingsPage: View {
                     SettingsDivider()
 
                     Button {
-                        showImport = true
+                        customPrompt = ""
+                        showCustomPrompt = true
                     } label: {
-                        SettingsNavRow(title: "导入 DeepSeek 对话", detail: "从 App 导出的 .zip 导入")
+                        SettingsNavRow(title: "自定义壁纸", detail: "说一句想要的样子，AI 写个网页壁纸")
                     }
                     .buttonStyle(.plain)
 
