@@ -608,9 +608,7 @@ struct AssistantBubble: View {
             if streaming {
                 ProgressView().scaleEffect(0.6).padding(.top, 3)
             }
-            Text(text)
-                .font(.system(size: 15))
-                .foregroundColor(Theme.textPrimary)
+            MarkdownView(text)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
