@@ -36,7 +36,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
             Self.notifyNow("DSH 屏幕识别 · 已连上 App",
                            "配置已取到（每 \(Int(loaded.intervalSeconds)) 秒一帧，模型 \(loaded.model)）。开始识别。")
-        case .failure(let message):
+        case .failure(let failure):
+            let message = failure.message
             diag { d in
                 d.groupOK = WatchShared.groupAvailable
                 d.configEnabled = false
