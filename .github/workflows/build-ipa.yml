@@ -1,0 +1,107 @@
+name: build-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned ipa
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          set -euo pipefail
+          echo "== xcodebuild =="
+          xcodebuild -version
+          echo "== swift =="
+          swift --version
+
+      - name: Install XcodeGen
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          ls -la DSH.xcodeproj
+
+      - name: Build (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project DSH.xcodeproj \
+            -scheme DSH \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      - name: Verify Info.plist
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/DSH.app"
+          PLIST="$APP/Info.plist"
+          if [ ! -f "$PLIST" ]; then
+            echo "::error::Info.plist not found: $PLIST"
+            exit 1
+          fi
+          for key in CFBundleIdentifier CFBundleDisplayName MinimumOSVersion; do
+            if ! value=$(/usr/libexec/PlistBuddy -c "Print :$key" "$PLIST"); then
+              echo "::error::Info.plist is missing key: $key"
+              exit 1
+            fi
+            echo "$key = $value"
+            if [ -z "$value" ]; then
+              echo "::error::Info.plist key is empty: $key"
+              exit 1
+            fi
+          done
+          if [ ! -f "$APP/DSH" ]; then
+            echo "::error::App executable not found: $APP/DSH"
+            exit 1
+          fi
+          file "$APP/DSH"
+
+      - name: Package unsigned ipa
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/DSH.app"
+          rm -rf artifacts
+          mkdir -p artifacts/Payload
+          cp -R "$APP" artifacts/Payload/
+          (cd artifacts && zip -qry ../DSH.ipa Payload)
+          ls -lh DSH.ipa
+          echo "== ipa contents =="
+          LISTING=$(unzip -l DSH.ipa)
+          echo "$LISTING"
+          if ! printf '%s\n' "$LISTING" | grep -Eq 'Payload/DSH\.app/DSH$'; then
+            echo "::error::DSH executable is missing inside the ipa"
+            exit 1
+          fi
+
+      - name: Upload ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSH-ipa
+          path: DSH.ipa
+          if-no-files-found: error
+          retention-days: 30
