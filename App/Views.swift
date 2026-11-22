@@ -1,22 +1,56 @@
 import SwiftUI
 
+// MARK: - 悬浮面板
+
+/// 所有面板都用这一套：毛玻璃底 + 细描边 + 投影，四周留白，不贴着屏幕边。
+private struct FloatingPanel: ViewModifier {
+    var radius: CGFloat = 26
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .fill(.ultraThinMaterial)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .shadow(color: Color.black.opacity(0.38), radius: 22, x: 0, y: 10)
+    }
+}
+
+private extension View {
+    func floatingPanel(radius: CGFloat = 26) -> some View {
+        modifier(FloatingPanel(radius: radius))
+    }
+}
+
 // MARK: - 根视图
 
-/// 两栏：左边会话，右边对话。壁纸铺在最底层，所有面板半透明浮在上面。
+/// 壁纸铺在最底层；左侧会话栏、右侧对话区都是悬浮卡片，四周离屏幕边缘有距离。
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var wallpaper = WallpaperStore.shared
+    @State private var showSidebar = true
 
     var body: some View {
         WallpaperBackground {
-            NavigationSplitView {
-                SessionList()
-                    .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
-            } detail: {
-                ChatScreen()
+            GeometryReader { geo in
+                HStack(spacing: 12) {
+                    if showSidebar {
+                        SidebarCard(showSidebar: $showSidebar)
+                            .frame(width: min(300, max(248, geo.size.width * 0.26)))
+                            .transition(.move(edge: .leading).combined(with: .opacity))
+                    }
+                    ChatCard(showSidebar: $showSidebar)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 10)
+                .padding(.bottom, 16)
             }
-            .navigationSplitViewStyle(.balanced)
         }
         .onAppear { wallpaper.load() }
         .onChange(of: scenePhase) { phase in
@@ -40,109 +74,146 @@ struct RootView: View {
     }
 }
 
-// MARK: - 侧边栏
+// MARK: - 侧边栏卡片
 
-struct SessionList: View {
+struct SidebarCard: View {
     @EnvironmentObject private var model: AppModel
+    @Binding var showSidebar: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            List {
-                ForEach(model.sessions) { session in
-                    sessionRow(session)
-                        .listRowBackground(
-                            RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
-                                .fill(session.id == model.currentSessionID ? Theme.accentSoft : Color.clear)
-                                .padding(.vertical, 2)
-                        )
-                        .listRowSeparator(.hidden)
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.select(session.id) }
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(model.sessions) { session in
+                        row(session)
+                    }
                 }
-                .onDelete { indexSet in
-                    let ids = indexSet.map { model.sessions[$0].id }
-                    ids.forEach { model.deleteSession($0) }
-                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 12)
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
         }
-        .background(Color.clear)
+        .floatingPanel()
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Text("DSH")
-                .font(Theme.title(22))
+                .font(Theme.title(21))
                 .foregroundColor(Theme.textPrimary)
             Text("iPad")
-                .font(.system(size: 11, weight: .medium))
+                .font(.system(size: 10, weight: .medium))
                 .foregroundColor(Theme.textTertiary)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
-                .background(
-                    Capsule().fill(Theme.surfaceStrong)
-                )
-            Spacer()
+                .background(Capsule().fill(Color.white.opacity(0.10)))
+            Spacer(minLength: 0)
             Button {
-                model.newSession()
+                withAnimation(.easeInOut(duration: 0.2)) { showSidebar = false }
+            } label: {
+                Image(systemName: "sidebar.leading")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Theme.textTertiary)
+                    .frame(width: 26, height: 26)
+            }
+            Menu {
+                Button {
+                    model.newSession(mode: .chat)
+                } label: {
+                    Label("新建对话 · 不带工具", systemImage: "bubble.left.and.bubble.right")
+                }
+                Button {
+                    model.newSession(mode: .work)
+                } label: {
+                    Label("新建工作 · 可改文件", systemImage: "hammer")
+                }
             } label: {
                 Image(systemName: "square.and.pencil")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(model.isRunning ? Theme.textTertiary : Theme.accent)
-                    .frame(width: 32, height: 32)
-                    .background(Circle().fill(Theme.surface))
+                    .frame(width: 28, height: 28)
+                    .background(Circle().fill(Color.white.opacity(0.10)))
             }
             .disabled(model.isRunning)
         }
-        .padding(.horizontal, Theme.pad)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
     }
 
-    private func sessionRow(_ session: ChatSession) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(session.title)
-                .font(Theme.body(15))
-                .foregroundColor(Theme.textPrimary)
-                .lineLimit(1)
-            Text(summary(session))
-                .font(.system(size: 12))
-                .foregroundColor(Theme.textTertiary)
-                .lineLimit(1)
+    private func row(_ session: ChatSession) -> some View {
+        let selected = session.id == model.currentSessionID
+        return Button {
+            model.select(session.id)
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: session.mode.systemImage)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(selected ? Theme.accent : Theme.textTertiary)
+                    .frame(width: 22, height: 22)
+                    .background(Circle().fill(Color.white.opacity(0.07)))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(session.title)
+                        .font(.system(size: 14, weight: selected ? .semibold : .regular))
+                        .foregroundColor(Theme.textPrimary)
+                        .lineLimit(1)
+                    Text(subtitle(session))
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(selected ? Theme.accentSoft : Color.clear)
+            )
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 8)
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button(role: .destructive) {
+                model.deleteSession(session.id)
+            } label: {
+                Label("删除对话", systemImage: "trash")
+            }
+            .disabled(model.isRunning || model.sessions.count <= 1)
+        }
     }
 
-    private func summary(_ session: ChatSession) -> String {
-        let count = session.items.count
+    private func subtitle(_ session: ChatSession) -> String {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .short
         formatter.locale = Locale(identifier: "zh_CN")
         let time = formatter.localizedString(for: session.updatedAt, relativeTo: Date())
-        return "\(count) 条 · \(time)"
+        return "\(session.mode.title) · \(session.items.count) 条 · \(time)"
     }
 }
 
-// MARK: - 对话
+// MARK: - 对话卡片
 
-struct ChatScreen: View {
+struct ChatCard: View {
     @EnvironmentObject private var model: AppModel
+    @Binding var showSidebar: Bool
+
     @State private var showSettings = false
     @State private var showPlugins = false
     @State private var showWallpaper = false
+    @State private var draft = ""
+
+    private var mode: SessionMode { model.currentSession?.mode ?? .chat }
 
     var body: some View {
         VStack(spacing: 0) {
             topBar
-            if model.isRunning { runningBanner }
+            if model.isRunning && mode == .work { runningBanner }
             if let text = model.errorText { errorBanner(text) }
             messageList
             composer
         }
-        .background(Color.clear)
+        .floatingPanel()
         .sheet(isPresented: $showSettings) {
             SettingsView().environmentObject(model)
         }
@@ -171,18 +242,47 @@ struct ChatScreen: View {
         }
     }
 
+    // MARK: 顶栏
+
     private var topBar: some View {
         HStack(spacing: 8) {
+            if !showSidebar {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { showSidebar = true }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(width: 28, height: 28)
+                        .background(Circle().fill(Color.white.opacity(0.10)))
+                }
+            }
+            modeMenu
             modelMenu
             effortMenu
-            Spacer()
+            Spacer(minLength: 0)
             iconButton("puzzlepiece.extension") { showPlugins = true }
             iconButton("photo") { showWallpaper = true }
             iconButton("gearshape") { showSettings = true }
         }
-        .padding(.horizontal, Theme.pad)
-        .padding(.vertical, 10)
-        .background(Theme.bg.opacity(0.55))
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+    }
+
+    private var modeMenu: some View {
+        Menu {
+            ForEach([SessionMode.chat, SessionMode.work], id: \.self) { option in
+                Button {
+                    model.setMode(option)
+                } label: {
+                    Label("\(option.title) · \(option.blurb)", systemImage: option.systemImage)
+                }
+            }
+        } label: {
+            chip(mode.title, systemImage: mode.systemImage, highlighted: true)
+        }
+        .disabled(model.isRunning)
     }
 
     private var modelMenu: some View {
@@ -205,7 +305,7 @@ struct ChatScreen: View {
                 Button("刷新模型列表") { Task { await model.fetchModels() } }
             }
         } label: {
-            chip(model.model, systemImage: "cpu")
+            chip(model.model, systemImage: "cpu", highlighted: false)
         }
     }
 
@@ -223,7 +323,7 @@ struct ChatScreen: View {
                 }
             }
         } label: {
-            chip(effortLabel(model.reasoningEffort), systemImage: "brain")
+            chip(effortLabel(model.reasoningEffort), systemImage: "brain", highlighted: false)
         }
     }
 
@@ -237,50 +337,51 @@ struct ChatScreen: View {
         }
     }
 
-    private func chip(_ text: String, systemImage: String) -> some View {
+    private func chip(_ text: String, systemImage: String, highlighted: Bool) -> some View {
         HStack(spacing: 5) {
-            Image(systemName: systemImage).font(.system(size: 11, weight: .semibold))
+            Image(systemName: systemImage).font(.system(size: 10, weight: .semibold))
             Text(text).font(.system(size: 12, weight: .medium)).lineLimit(1)
-            Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+            Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
         }
-        .foregroundColor(Theme.textSecondary)
+        .foregroundColor(highlighted ? Theme.accent : Theme.textSecondary)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(Capsule().fill(Theme.surface.opacity(0.9)))
-        .overlay(Capsule().stroke(Theme.stroke, lineWidth: 1))
+        .background(
+            Capsule().fill(highlighted ? Theme.accentSoft : Color.white.opacity(0.08))
+        )
     }
 
     private func iconButton(_ systemName: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
-                .font(.system(size: 15, weight: .medium))
+                .font(.system(size: 14, weight: .medium))
                 .foregroundColor(Theme.textSecondary)
-                .frame(width: 32, height: 32)
-                .background(Circle().fill(Theme.surface.opacity(0.9)))
+                .frame(width: 30, height: 30)
+                .background(Circle().fill(Color.white.opacity(0.08)))
         }
     }
 
     private var runningBanner: some View {
         HStack(spacing: 10) {
-            ProgressView().scaleEffect(0.75)
+            ProgressView().scaleEffect(0.7)
             Text(model.statusLine.isEmpty ? "正在运行…" : model.statusLine)
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundColor(Theme.warning)
                 .lineLimit(1)
-            Spacer()
+            Spacer(minLength: 0)
             Text("请留在本 App")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(Theme.warning.opacity(0.8))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(Theme.warning.opacity(0.85))
         }
-        .padding(.horizontal, Theme.pad)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
         .background(Theme.warning.opacity(0.12))
     }
 
     private func errorBanner(_ text: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 12))
+                .font(.system(size: 11))
                 .foregroundColor(Theme.danger)
             Text(text)
                 .font(.system(size: 12))
@@ -290,19 +391,25 @@ struct ChatScreen: View {
             Button {
                 model.errorText = nil
             } label: {
-                Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(Theme.textTertiary)
             }
         }
-        .padding(.horizontal, Theme.pad)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
         .background(Theme.danger.opacity(0.12))
     }
+
+    // MARK: 消息
 
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
+                    if model.currentItems.isEmpty {
+                        emptyHint
+                    }
                     ForEach(model.currentItems) { item in
                         MessageRow(item: item).id(item.id)
                     }
@@ -313,12 +420,9 @@ struct ChatScreen: View {
                         AssistantBubble(text: model.streamPreview, streaming: true)
                             .id("stream-preview")
                     }
-                    if model.currentItems.isEmpty {
-                        emptyHint
-                    }
                 }
-                .padding(.horizontal, Theme.pad)
-                .padding(.vertical, 16)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 14)
             }
             .onChange(of: model.currentItems.count) { _ in scrollToBottom(proxy) }
             .onChange(of: model.streamPreview) { _ in scrollToBottom(proxy) }
@@ -328,15 +432,23 @@ struct ChatScreen: View {
 
     private var emptyHint: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("说点什么")
-                .font(Theme.title(20))
-                .foregroundColor(Theme.textPrimary)
-            Text("工具和文件都在这台 iPad 上执行，模型走 API。文件在「文件」App 的 DSH/workspace 里，可以直接拖进来。")
+            HStack(spacing: 7) {
+                Image(systemName: mode.systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Theme.accent)
+                Text(mode == .chat ? "先聊两句" : "说一句要做什么")
+                    .font(Theme.title(19))
+                    .foregroundColor(Theme.textPrimary)
+            }
+            Text(mode == .chat
+                 ? "对话模式：不带工具、不碰文件，随便聊。需要动文件时切到「工作」。"
+                 : "工作模式：可以读写工作目录里的文件。长任务跑起来请留在本 App，切到后台会被挂断。")
                 .font(.system(size: 13))
                 .foregroundColor(Theme.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.top, 40)
+        .padding(.top, 30)
+        .frame(maxWidth: 460, alignment: .leading)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -346,61 +458,69 @@ struct ChatScreen: View {
         }
     }
 
+    // MARK: 输入区（卡片内再浮一层）
+
     private var composer: some View {
-        VStack(spacing: 0) {
-            Divider().overlay(Theme.stroke)
-            VStack(alignment: .leading, spacing: 8) {
+        VStack(spacing: 8) {
+            ZStack(alignment: .topLeading) {
+                if draft.isEmpty {
+                    Text(mode == .chat ? "说点什么…" : "要它做什么…")
+                        .font(.system(size: 15))
+                        .foregroundColor(Theme.textTertiary)
+                        .padding(.top, 8)
+                        .padding(.leading, 5)
+                        .allowsHitTesting(false)
+                }
                 TextEditor(text: $draft)
                     .font(.system(size: 15))
                     .foregroundColor(Theme.textPrimary)
-                    .frame(minHeight: 40, maxHeight: 110)
+                    .frame(minHeight: 38, maxHeight: 110)
                     .scrollContentBackground(.hidden)
                     .background(Color.clear)
-                    .padding(.horizontal, 4)
-                HStack(spacing: 8) {
-                    if model.isRunning {
-                        Label("运行中", systemImage: "bolt.fill")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Theme.warning)
-                    }
-                    Spacer()
-                    Button {
-                        if model.isRunning {
-                            model.stop()
-                        } else {
-                            let text = draft
-                            draft = ""
-                            model.send(text)
-                        }
-                    } label: {
-                        Image(systemName: model.isRunning ? "stop.fill" : "arrow.up")
-                            .font(.system(size: 15, weight: .bold))
-                            .foregroundColor(model.isRunning ? Theme.bg : Theme.textTertiary)
-                            .frame(width: 34, height: 34)
-                            .background(Circle().fill(model.isRunning ? Theme.danger : Theme.accent))
-                    }
-                    .disabled(!model.isRunning && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
             }
-            .padding(10)
-            .background(
-                RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-                    .fill(Theme.surface.opacity(0.92))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
-                    .stroke(Theme.stroke, lineWidth: 1)
-            )
-            .padding(.horizontal, Theme.pad)
-            .padding(.vertical, 10)
+            HStack(spacing: 8) {
+                if model.isRunning {
+                    HStack(spacing: 5) {
+                        Image(systemName: "bolt.fill").font(.system(size: 9, weight: .semibold))
+                        Text("运行中").font(.system(size: 11, weight: .medium))
+                    }
+                    .foregroundColor(Theme.warning)
+                }
+                Spacer(minLength: 0)
+                Button {
+                    if model.isRunning {
+                        model.stop()
+                    } else {
+                        let text = draft
+                        draft = ""
+                        model.send(text)
+                    }
+                } label: {
+                    Image(systemName: model.isRunning ? "stop.fill" : "arrow.up")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(model.isRunning ? Theme.bg : Theme.textTertiary)
+                        .frame(width: 32, height: 32)
+                        .background(Circle().fill(model.isRunning ? Theme.danger : Theme.accent))
+                }
+                .disabled(!model.isRunning && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
         }
-        .background(Theme.bg.opacity(0.5))
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.07))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+        )
+        .padding(.horizontal, 14)
+        .padding(.bottom, 14)
+        .padding(.top, 4)
     }
-
-    @State private var draft = ""
 }
 
-// MARK: - 消息
+// MARK: - 消息组件
 
 struct MessageRow: View {
     let item: ChatItem
@@ -409,14 +529,14 @@ struct MessageRow: View {
         switch item.role {
         case .user:
             HStack {
-                Spacer(minLength: 60)
+                Spacer(minLength: 80)
                 Text(item.text)
                     .font(.system(size: 15))
                     .foregroundColor(Theme.textPrimary)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
                     .background(
-                        RoundedRectangle(cornerRadius: Theme.radius, style: .continuous)
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
                             .fill(Theme.accentSoft)
                     )
             }
@@ -448,9 +568,9 @@ struct AssistantBubble: View {
     let streaming: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             if streaming {
-                ProgressView().scaleEffect(0.65)
+                ProgressView().scaleEffect(0.6).padding(.top, 3)
             }
             Text(text)
                 .font(.system(size: 15))
@@ -460,9 +580,12 @@ struct AssistantBubble: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.vertical, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .dshCard(padding: 0)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
     }
 }
 
@@ -477,12 +600,11 @@ struct ReasoningBubble: View {
                 withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
             } label: {
                 HStack(spacing: 6) {
-                    Image(systemName: "brain")
-                        .font(.system(size: 11, weight: .semibold))
+                    Image(systemName: "brain").font(.system(size: 10, weight: .semibold))
                     Text(streaming ? "思考中…" : "思考过程")
                         .font(.system(size: 12, weight: .medium))
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.system(size: 8, weight: .semibold))
                 }
                 .foregroundColor(Theme.textTertiary)
             }
@@ -499,8 +621,8 @@ struct ReasoningBubble: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
-                .fill(Theme.surface.opacity(0.55))
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.04))
         )
     }
 }
@@ -512,14 +634,14 @@ struct ToolChip: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 9, weight: .semibold))
             Text(call.name)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
         }
         .foregroundColor(Theme.accent)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
         .background(Capsule().fill(Theme.accentSoft))
     }
 }
@@ -538,25 +660,25 @@ struct ToolCard: View {
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: item.isError ? "exclamationmark.triangle" : "terminal")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(color)
                     Text(title)
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(color)
                     Text(firstLine)
-                        .font(.system(size: 12))
+                        .font(.system(size: 11))
                         .foregroundColor(Theme.textTertiary)
                         .lineLimit(1)
                     Spacer(minLength: 0)
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(Theme.textTertiary)
                 }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 9)
+                .padding(.vertical, 8)
             }
             if expanded {
-                Divider().overlay(Theme.stroke)
+                Divider().overlay(Color.white.opacity(0.08))
                 ScrollView(.vertical, showsIndicators: true) {
                     Text(item.text)
                         .font(.system(.caption, design: .monospaced))
@@ -569,12 +691,13 @@ struct ToolCard: View {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
-                .fill(Theme.surface.opacity(0.7))
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.05))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous)
-                .stroke(item.isError ? Theme.danger.opacity(0.4) : Theme.stroke, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(item.isError ? Theme.danger.opacity(0.35) : Color.white.opacity(0.07),
+                              lineWidth: 1)
         )
     }
 
@@ -656,7 +779,7 @@ struct SettingsView: View {
                 } header: {
                     Text("模型与推理")
                 } footer: {
-                    Text(effortFooter)
+                    Text("推理等级对应 DeepSeek 的 thinking effort：关闭不发思考，最高会明显更慢也更贵。")
                 }
 
                 Section {
@@ -667,9 +790,11 @@ struct SettingsView: View {
                             Text("\(model.maxRounds)").foregroundColor(Theme.textSecondary)
                         }
                     }
-                    Toggle("开跑前提醒别切走", isOn: $model.warnBeforeRun)
+                    Toggle("工作模式开跑前提醒别切走", isOn: $model.warnBeforeRun)
                 } header: {
                     Text("运行")
+                } footer: {
+                    Text("对话模式不带工具，不会弹这个提醒。")
                 }
 
                 Section {
@@ -728,9 +853,5 @@ struct SettingsView: View {
         case "max": return "最高 · 只在最难的活上用"
         default: return effort
         }
-    }
-
-    private var effortFooter: String {
-        "推理等级对应 DeepSeek 的 thinking effort：关闭不发思考，最高会明显更慢也更贵。"
     }
 }
