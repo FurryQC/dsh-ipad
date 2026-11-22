@@ -217,6 +217,8 @@ struct ChatCard: View {
     @State private var showPlugins = false
     @State private var showWallpaper = false
     @State private var draft = ""
+    /// 用户自己往上翻时停掉自动跟随；新消息、重新发送、点「回到底部」再打开。
+    @State private var autoScroll = true
 
     private var mode: SessionMode { model.currentSession?.mode ?? .chat }
 
@@ -451,6 +453,7 @@ struct ChatCard: View {
                     }
                     if model.isRunning && !model.reasoningPreview.isEmpty {
                         ReasoningBubble(text: model.reasoningPreview, streaming: true)
+                            .id("reasoning-preview")
                     }
                     if model.isRunning && !model.streamPreview.isEmpty {
                         AssistantBubble(text: model.streamPreview, streaming: true)
@@ -460,9 +463,39 @@ struct ChatCard: View {
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
             }
-            .onChange(of: model.currentItems.count) { _ in scrollToBottom(proxy) }
-            .onChange(of: model.streamPreview) { _ in scrollToBottom(proxy) }
-            .onChange(of: model.reasoningPreview) { _ in scrollToBottom(proxy) }
+            // 手指一拖就停掉自动跟随：否则流式输出每来一段都会把正在看的位置往下拽。
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 6).onChanged { _ in
+                    if autoScroll { autoScroll = false }
+                }
+            )
+            .onChange(of: model.currentItems.count) { _ in
+                autoScroll = true
+                scrollToBottom(proxy)
+            }
+            .onChange(of: model.streamPreview) { _ in
+                if autoScroll { scrollToBottom(proxy) }
+            }
+            .onChange(of: model.reasoningPreview) { _ in
+                if autoScroll { scrollToBottom(proxy) }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !autoScroll {
+                    Button {
+                        autoScroll = true
+                        scrollToBottom(proxy)
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(Theme.textPrimary)
+                            .frame(width: 30, height: 30)
+                            .background(Circle().fill(.ultraThinMaterial))
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+                    }
+                    .padding(.trailing, 8)
+                    .padding(.bottom, 8)
+                }
+            }
         }
     }
 
@@ -497,22 +530,22 @@ struct ChatCard: View {
     // MARK: 输入区（卡片内再浮一层）
 
     private var composer: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             ZStack(alignment: .topLeading) {
                 if draft.isEmpty {
                     Text(mode == .chat ? "说点什么…" : "要它做什么…")
                         .font(.system(size: 15))
                         .foregroundColor(Theme.textTertiary)
-                        .padding(.top, 8)
+                        .padding(.vertical, 1)
                         .padding(.leading, 5)
                         .allowsHitTesting(false)
                 }
-                TextEditor(text: $draft)
+                TextField("", text: $draft, axis: .vertical)
+                    .lineLimit(1...5)
+                    .textFieldStyle(.plain)
                     .font(.system(size: 15))
                     .foregroundColor(Theme.textPrimary)
-                    .frame(minHeight: 38, maxHeight: 110)
-                    .scrollContentBackground(.hidden)
-                    .background(Color.clear)
+                    .padding(.vertical, 1)
             }
             HStack(spacing: 8) {
                 if model.isRunning {
@@ -529,19 +562,21 @@ struct ChatCard: View {
                     } else {
                         let text = draft
                         draft = ""
+                        autoScroll = true
                         model.send(text)
                     }
                 } label: {
                     Image(systemName: model.isRunning ? "stop.fill" : "arrow.up")
-                        .font(.system(size: 14, weight: .bold))
+                        .font(.system(size: 13, weight: .bold))
                         .foregroundColor(model.isRunning ? Theme.bg : Theme.textTertiary)
-                        .frame(width: 32, height: 32)
+                        .frame(width: 28, height: 28)
                         .background(Circle().fill(model.isRunning ? Theme.danger : Theme.accent))
                 }
                 .disabled(!model.isRunning && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(10)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color.white.opacity(0.07))
@@ -551,8 +586,8 @@ struct ChatCard: View {
                 .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
         )
         .padding(.horizontal, 14)
-        .padding(.bottom, 14)
-        .padding(.top, 4)
+        .padding(.bottom, 10)
+        .padding(.top, 2)
     }
 }
 
