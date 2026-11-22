@@ -1,0 +1,43 @@
+name: DSH
+
+options:
+  bundleIdPrefix: com.dsh
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  DSH:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+    # 不用 XcodeGen 的 info: 块：它会重写 Info.plist，等于把 plist 复制成两份。
+    # 这里只通过 INFOPLIST_FILE 指向仓库里那份，保持单一来源。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dsh.ipad
+        PRODUCT_NAME: DSH
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "2"
+        SWIFT_VERSION: "5.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # 引号是必要的：裸 NO 在 YAML 1.1 里是布尔 false，XcodeGen 会把值写成 false/0。
+        CODE_SIGNING_ALLOWED: "NO"
+        ENABLE_BITCODE: "NO"
+        SUPPORTS_MACCATALYST: "NO"
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+
+schemes:
+  DSH:
+    build:
+      targets:
+        DSH: all
+    run:
+      config: Debug
