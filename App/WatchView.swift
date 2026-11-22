@@ -105,8 +105,9 @@ struct WatchView: View {
                 }
             }
             Divider().overlay(Theme.stroke)
-            diagRow("App Group", WatchShared.groupAvailable ? "可用" : "不可用（重签没加 group.com.dsh.qc）",
-                    good: WatchShared.groupAvailable)
+            diagRow("App Group", WatchShared.containerDiagnostics(),
+                    good: WatchShared.groupAvailable && WatchShared.groupProbe() == "ok")
+            diagRow("容器路径", WatchShared.containerPath, good: WatchShared.containerURL != nil)
             diagRow("配置", diag.configEnabled ? "已启用" : "未启用 / 没读到", good: diag.configEnabled)
             diagRow("扩展心跳", heartbeatText, good: heartbeatFresh)
             diagRow("收到帧", "\(diag.frames)", good: diag.frames > 0)
@@ -165,6 +166,8 @@ struct WatchView: View {
                     .frame(width: 190, height: 52)
                 Spacer()
             }
+            // 点圆钮的同时把配置写进共享容器，省掉「忘了点保存」这一步。
+            .simultaneousGesture(TapGesture().onEnded { save() })
             Text("停止：从屏幕右上角红色胶囊点一下，或者回到系统控制中心停止录制。")
                 .font(.system(size: 11))
                 .foregroundColor(Theme.textTertiary)
@@ -287,15 +290,19 @@ struct WatchView: View {
     }
 
     private func save() {
-        // 扩展读不到钥匙串，所以把 key 复制进 App Group 容器。
+        // 扩展读不到钥匙串，所以把 key 复制进共享容器（UserDefaults + 文件双写）。
         let key = Keychain.loadAPIKey()
         if !key.isEmpty { config.apiKey = key }
         WatchShared.save(config)
         savedHint = true
+        // 写完立刻按扩展那条路径读回来，把「到底写进去了没有、从哪读的」摊开。
+        let check = WatchShared.loadConfigDetailed()
         if config.apiKey.isEmpty {
             status = "还没填 API key：先回设置页填一次，再回来保存。"
+        } else if check.config.enabled {
+            status = "已写入共享容器（读回来源：\(check.source)）。\(check.detail)"
         } else {
-            status = ""
+            status = "写入后读不回来（读回来源：\(check.source)）。\(check.detail)"
         }
     }
 
