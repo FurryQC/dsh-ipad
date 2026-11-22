@@ -36,40 +36,54 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var wallpaper = WallpaperStore.shared
     @State private var showSidebar = true
+    @State private var showSplash = true
 
     var body: some View {
-        WallpaperBackground {
-            GeometryReader { geo in
-                HStack(spacing: 12) {
-                    if showSidebar {
-                        SidebarCard(showSidebar: $showSidebar)
-                            .frame(width: min(300, max(248, geo.size.width * 0.26)))
-                            .transition(.move(edge: .leading).combined(with: .opacity))
+        ZStack {
+            WallpaperBackground {
+                GeometryReader { geo in
+                    HStack(spacing: 12) {
+                        if showSidebar {
+                            SidebarCard(showSidebar: $showSidebar)
+                                .frame(width: min(300, max(248, geo.size.width * 0.26)))
+                                .transition(.move(edge: .leading).combined(with: .opacity))
+                        }
+                        ChatCard(showSidebar: $showSidebar)
                     }
-                    ChatCard(showSidebar: $showSidebar)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 10)
+                    .padding(.bottom, 16)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 10)
-                .padding(.bottom, 16)
             }
-        }
-        .onAppear { wallpaper.load() }
-        .onChange(of: scenePhase) { phase in
-            switch phase {
-            case .active: model.handleScenePhase(.active)
-            case .inactive: model.handleScenePhase(.inactive)
-            case .background: model.handleScenePhase(.background)
-            @unknown default: break
+            .onAppear { wallpaper.load() }
+            .onChange(of: scenePhase) { phase in
+                switch phase {
+                case .active: model.handleScenePhase(.active)
+                case .inactive: model.handleScenePhase(.inactive)
+                case .background: model.handleScenePhase(.background)
+                @unknown default: break
+                }
             }
-        }
-        .alert("任务运行期间别切走", isPresented: Binding(
-            get: { model.showSwitchWarning },
-            set: { if !$0 { model.cancelSwitchWarning() } }
-        )) {
-            Button("开始任务") { model.confirmSwitchWarning() }
-            Button("取消", role: .cancel) { model.cancelSwitchWarning() }
-        } message: {
-            Text("iPadOS 会在 App 进入后台几十秒后挂起它，正在跑的请求会被切断。任务做完再切。")
+            .alert("任务运行期间别切走", isPresented: Binding(
+                get: { model.showSwitchWarning },
+                set: { if !$0 { model.cancelSwitchWarning() } }
+            )) {
+                Button("开始任务") { model.confirmSwitchWarning() }
+                Button("取消", role: .cancel) { model.cancelSwitchWarning() }
+            } message: {
+                Text("iPadOS 会在 App 进入后台几十秒后挂起它，正在跑的请求会被切断。任务做完再切。")
+            }
+
+            // 启动动画盖在最上层，自己跑完 1.66 秒后回调。下面这层透明蒙板拦住这期间的触摸。
+            if showSplash {
+                ZStack {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture { }
+                    LaunchSplashOverlay(onFinish: { showSplash = false })
+                }
+                .zIndex(10)
+            }
         }
         .preferredColorScheme(.dark)
     }
