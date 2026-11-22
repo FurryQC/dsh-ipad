@@ -1,5 +1,6 @@
 import SwiftUI
 import ReplayKit
+import UIKit
 import UserNotifications
 
 /// 屏幕识别（直播捕捉）设置页。
@@ -15,6 +16,7 @@ struct WatchView: View {
     @State private var diag = WatchShared.readDiag()
     @State private var status: String = ""
     @State private var savedHint = false
+    @State private var notifyAllowed: Bool?
 
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -45,6 +47,7 @@ struct WatchView: View {
             .onAppear {
                 config = WatchShared.load()
                 requestNotificationPermission()
+                refreshNotificationState()
                 refreshLastResult()
                 diag = WatchShared.readDiag()
             }
@@ -65,6 +68,21 @@ struct WatchView: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(Theme.textSecondary)
                 Spacer()
+            }
+            HStack(spacing: 6) {
+                Text("通知权限")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.textTertiary)
+                Text(notifyText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(notifyAllowed == true ? Theme.success : Theme.warning)
+                Spacer()
+                Button("检查") { refreshNotificationState() }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.accent)
+                Button("去设置") { openAppSettings() }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.accent)
             }
             Divider().overlay(Theme.stroke)
             Text("最近一条结果")
@@ -308,6 +326,36 @@ struct WatchView: View {
 
     private func requestNotificationPermission() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
+
+    private var notifyText: String {
+        switch notifyAllowed {
+        case .some(true):
+            return "已允许"
+        case .some(false):
+            return "没开 · 结果没人看得到"
+        case .none:
+            return "查询中…"
+        }
+    }
+
+    /// 查一次系统通知授权状态，直接决定扩展能不能把结果送到用户眼前。
+    private func refreshNotificationState() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let ok: Bool
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                ok = true
+            default:
+                ok = false
+            }
+            DispatchQueue.main.async { notifyAllowed = ok }
+        }
+    }
+
+    private func openAppSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 
     private func refreshLastResult() {
