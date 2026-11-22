@@ -218,8 +218,6 @@ struct ChatCard: View {
     @Binding var showSidebar: Bool
 
     @State private var showSettings = false
-    @State private var showPlugins = false
-    @State private var showWallpaper = false
     @State private var draft = ""
     @State private var showAttachPanel = false
     /// 用户自己往上翻时停掉自动跟随；新消息、重新发送、点「回到底部」再打开。
@@ -239,29 +237,6 @@ struct ChatCard: View {
         .floatingPanel()
         .sheet(isPresented: $showSettings) {
             SettingsView().environmentObject(model)
-        }
-        .sheet(isPresented: $showPlugins) {
-            NavigationView {
-                PluginListView(host: PluginHost.shared)
-                    .navigationTitle("插件")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("完成") { showPlugins = false }
-                        }
-                    }
-            }
-        }
-        .sheet(isPresented: $showWallpaper) {
-            NavigationView {
-                WallpaperPickerView()
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("完成") { showWallpaper = false }
-                        }
-                    }
-            }
         }
         .sheet(isPresented: $showAttachPanel) {
             AttachmentPanel()
@@ -350,8 +325,6 @@ struct ChatCard: View {
             modelMenu
             effortMenu
             Spacer(minLength: 0)
-            iconButton("puzzlepiece.extension") { showPlugins = true }
-            iconButton("photo") { showWallpaper = true }
             iconButton("gearshape") { showSettings = true }
         }
         .padding(.horizontal, 14)
@@ -1013,6 +986,50 @@ struct AttachmentThumb: View {
 }
 
 /// 「+」打出来的面板：相册 / 拍照 / 文件。图片直接进 Messages 的 image 块，文件复制进工作目录。
+/// 系统文件 App 的选择器。文件拿回 security-scoped URL，调用方负责 start/stopAccessing。
+struct DocumentPicker: UIViewControllerRepresentable {
+    enum Mode {
+        /// 多选任意文件
+        case files
+        /// 单选一个文件夹（外部目录授权用）
+        case folders
+    }
+
+    let mode: Mode
+    let onPick: ([URL]) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let types: [UTType] = mode == .folders ? [.folder] : [.item]
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
+        picker.allowsMultipleSelection = mode == .files
+        picker.shouldShowFileExtensions = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let onPick: ([URL]) -> Void
+
+        init(onPick: @escaping ([URL]) -> Void) {
+            self.onPick = onPick
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            onPick(urls)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            onPick([])
+        }
+    }
+}
+
 struct AttachmentPanel: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -1069,14 +1086,16 @@ struct AttachmentPanel: View {
             }
             .ignoresSafeArea()
         }
-        .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
-            switch result {
-            case .success(let urls):
+        // 用自己包的 UIDocumentPicker 而不是 .fileImporter：附件面板本身是一张 sheet，
+        // 从 sheet 里再触发 fileImporter 会撞上「已经有界面在展示」，表现就是点了没反应。
+        .sheet(isPresented: $showFiles) {
+            DocumentPicker(mode: .files) { urls in
+                showFiles = false
+                guard !urls.isEmpty else { return }
                 for url in urls { ingestFile(url) }
-                if !urls.isEmpty { dismiss() }
-            case .failure(let error):
-                errorText = "选文件失败：\(error.localizedDescription)"
+                dismiss()
             }
+            .ignoresSafeArea()
         }
         .alert("附件没加上", isPresented: Binding(get: { errorText != nil }, set: { if !$0 { errorText = nil } })) {
             Button("知道了", role: .cancel) { errorText = nil }
@@ -1112,13 +1131,20 @@ struct AttachmentPanel: View {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         do {
-            let data = try Data(contentsOf: url)
+            // iCloud 里的文件可能还没落到本地，先要一份数据再读。
+            let data: Data
+            if let local = try? Data(contentsOf: url) {
+                data = local
+            } else {
+                try FileManager.default.startDownloadingUbiquitousItem(at: url)
+                data = try Data(contentsOf: url)
+            }
             let type = UTType(filenameExtension: url.pathExtension)
             let mime = type?.preferredMIMEType ?? "application/octet-stream"
             let kind: AttachmentKind = (type?.conforms(to: .image) ?? false) ? .image : .file
             ingest(data: data, fileName: url.lastPathComponent, mimeType: mime, kind: kind)
         } catch {
-            errorText = "读不了这个文件：\(url.lastPathComponent)"
+            errorText = "读不了这个文件：\(url.lastPathComponent)\n\(error.localizedDescription)"
         }
     }
 
@@ -1254,6 +1280,8 @@ struct SettingsView: View {
     @State private var mounts: [MountedFolder] = []
     @State private var showFolderPicker = false
     @State private var mountError: String?
+    @State private var showWallpaperSheet = false
+    @State private var showPluginsSheet = false
 
     var body: some View {
         NavigationView {
@@ -1347,10 +1375,32 @@ struct SettingsView: View {
                         }
                         Slider(value: $model.cardOpacity, in: 0.25...1.0)
                     }
+                    Button {
+                        showWallpaperSheet = true
+                    } label: {
+                        HStack {
+                            Label("壁纸", systemImage: "photo")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(Theme.textTertiary)
+                        }
+                    }
+                    Button {
+                        showPluginsSheet = true
+                    } label: {
+                        HStack {
+                            Label("插件", systemImage: "puzzlepiece.extension")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(Theme.textTertiary)
+                        }
+                    }
                 } header: {
-                    Text("外观")
+                    Text("外观与扩展")
                 } footer: {
-                    Text("调低能多看到一点壁纸，调高字更清楚。")
+                    Text("不透明度调低能多看到一点壁纸，调高字更清楚。壁纸支持照片和视频；插件是 JavaScript 写的工具，放在「文件」App 的 DSH/plugins 里。")
                 }
 
                 Section {
@@ -1404,14 +1454,15 @@ struct SettingsView: View {
                     Text("能力边界")
                 }
             }
+            // 设置页做成一层磨砂玻璃：底下透出主界面的壁纸，行背景交给系统行本身。
+            .scrollContentBackground(.hidden)
+            .background(.ultraThinMaterial, ignoresSafeAreaEdges: .all)
             .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear { mounts = MountStore.shared.mounts }
-            .fileImporter(isPresented: $showFolderPicker,
-                          allowedContentTypes: [.folder],
-                          allowsMultipleSelection: false) { result in
-                switch result {
-                case .success(let urls):
+            .sheet(isPresented: $showFolderPicker) {
+                DocumentPicker(mode: .folders) { urls in
+                    showFolderPicker = false
                     guard let url = urls.first else { return }
                     do {
                         _ = try MountStore.shared.add(url: url)
@@ -1419,9 +1470,24 @@ struct SettingsView: View {
                     } catch {
                         mountError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
                     }
-                case .failure(let error):
-                    mountError = error.localizedDescription
                 }
+                .ignoresSafeArea()
+            }
+            .sheet(isPresented: $showWallpaperSheet) {
+                WallpaperPickerView()
+            }
+            .sheet(isPresented: $showPluginsSheet) {
+                NavigationView {
+                    PluginListView(host: PluginHost.shared)
+                        .navigationTitle("插件")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("完成") { showPluginsSheet = false }
+                            }
+                        }
+                }
+                .navigationViewStyle(.stack)
             }
             .alert("文件夹没授权上", isPresented: Binding(
                 get: { mountError != nil },

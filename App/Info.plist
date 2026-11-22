@@ -33,6 +33,12 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>拍照后直接发给模型看图，或者存进工作目录。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>从相册选图片发给模型看。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>把处理过的图片存回相册。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

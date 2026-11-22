@@ -59,6 +59,31 @@ struct ChatItem: Identifiable, Codable, Hashable {
     var attachments: [AttachmentRef] = []
 }
 
+/// 手写解码放在扩展里：扩展不会顶掉结构体的逐成员初始化器，而合成的解码器一旦缺键
+/// 就会让整份 sessions.json 解码失败 —— 表现就是升级后「对话记录丢了」。
+extension ChatItem {
+    private enum CodingKeys: String, CodingKey {
+        case id, role, text, toolCalls, toolCallId, toolName
+        case isError, isRunning, reasoning, reasoningSignature, attachments
+    }
+
+    /// 每个字段都允许缺失，缺了就用默认值。新增字段之后旧会话文件仍然算合法输入。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        role = try container.decodeIfPresent(ChatRole.self, forKey: .role) ?? .user
+        text = try container.decodeIfPresent(String.self, forKey: .text) ?? ""
+        toolCalls = try container.decodeIfPresent([ToolCall].self, forKey: .toolCalls) ?? []
+        toolCallId = try container.decodeIfPresent(String.self, forKey: .toolCallId)
+        toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
+        isError = try container.decodeIfPresent(Bool.self, forKey: .isError) ?? false
+        isRunning = try container.decodeIfPresent(Bool.self, forKey: .isRunning) ?? false
+        reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
+        reasoningSignature = try container.decodeIfPresent(String.self, forKey: .reasoningSignature)
+        attachments = try container.decodeIfPresent([AttachmentRef].self, forKey: .attachments) ?? []
+    }
+}
+
 struct ChatSession: Identifiable, Codable {
     var id: UUID
     var title: String

@@ -736,18 +736,42 @@ final class AppModel: ObservableObject {
 
     private func loadSessions() {
         guard FileManager.default.fileExists(atPath: storeURL.path) else { return }
-        do {
-            let data = try Data(contentsOf: storeURL)
-            let decoded = try JSONDecoder().decode([ChatSession].self, from: data)
-            if decoded.isEmpty { return }
+        guard let data = try? Data(contentsOf: storeURL), !data.isEmpty else { return }
+        if let decoded = try? JSONDecoder().decode([ChatSession].self, from: data), !decoded.isEmpty {
             sessions = decoded
             currentSessionID = decoded[0].id
-        } catch {
-            // 解码失败时先备份，避免下一次 save 把历史覆盖成空。
-            let backup = storeURL.deletingLastPathComponent().appendingPathComponent("sessions.bak.json")
-            try? FileManager.default.removeItem(at: backup)
-            try? FileManager.default.moveItem(at: storeURL, to: backup)
+            return
         }
+        // 整份解码失败时逐条抢救：坏一条不该连带丢掉其它会话。
+        let salvaged = salvageSessions(from: data)
+        if !salvaged.isEmpty {
+            backupStoreFile()
+            sessions = salvaged
+            currentSessionID = salvaged[0].id
+            save()
+            return
+        }
+        backupStoreFile()
+    }
+
+    /// 把 JSON 数组逐元素解码，跳过错的那几条，剩下的照样能用。
+    private func salvageSessions(from data: Data) -> [ChatSession] {
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [Any] else { return [] }
+        let decoder = JSONDecoder()
+        var result: [ChatSession] = []
+        for element in raw {
+            guard let piece = try? JSONSerialization.data(withJSONObject: element),
+                  let session = try? decoder.decode(ChatSession.self, from: piece) else { continue }
+            result.append(session)
+        }
+        return result
+    }
+
+    /// 解码失败的文件留一份，别让下一次 save 直接覆盖掉。
+    private func backupStoreFile() {
+        let backup = storeURL.deletingLastPathComponent().appendingPathComponent("sessions.bak.json")
+        try? FileManager.default.removeItem(at: backup)
+        try? FileManager.default.moveItem(at: storeURL, to: backup)
     }
 
     private func save() {
