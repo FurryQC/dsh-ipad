@@ -162,7 +162,7 @@ struct SettingsPage: View {
                     SettingsDivider()
 
                     Button {
-                        model.fetchModels()
+                        Task { await model.fetchModels() }
                     } label: {
                         HStack {
                             Text("刷新模型列表").font(.system(size: 15)).foregroundColor(Theme.textPrimary)
