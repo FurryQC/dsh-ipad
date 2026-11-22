@@ -7,18 +7,22 @@ import Foundation
 /// 连共享 UserDefaults 也读不到（实测就是这样）。loopback 不需要任何 entitlement。
 enum WatchConfigClient {
 
+    struct Failure: Error {
+        let message: String
+    }
+
     private static let timeout: TimeInterval = 1.5
     private static let attempts = 12
 
     /// 取一次配置；主 App 可能刚进后台还没起服务，所以带重试。
-    static func fetch() -> Result<WatchShared.Config, String> {
+    static func fetch() -> Result<WatchShared.Config, Failure> {
         var lastError = "主 App 的配置服务没响应"
         for index in 1...attempts {
             if let config = tryFetch() { return .success(config) }
             lastError = "第 \(index) 次请求 127.0.0.1:\(WatchShared.loopbackPort)/config 没拿到配置"
             if index < attempts { Thread.sleep(forTimeInterval: 0.8) }
         }
-        return .failure(lastError)
+        return .failure(Failure(message: lastError))
     }
 
     private static func tryFetch() -> WatchShared.Config? {
