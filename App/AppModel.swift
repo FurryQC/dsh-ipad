@@ -1,5 +1,6 @@
 import Combine
 import UniformTypeIdentifiers
+import UserNotifications
 import Foundation
 import UIKit
 
@@ -116,6 +117,7 @@ final class AppModel: ObservableObject {
         loadSessions()
         totalTokens = defaults.integer(forKey: Keys.totalTokens)
         systemPromptOverride = UserDefaults.standard.string(forKey: AppModel.systemPromptKey) ?? ""
+        installWatchBridge()
         NotificationCenter.default.addObserver(forName: Tools.configChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.reloadConfig() }
         }
@@ -848,6 +850,118 @@ final class AppModel: ObservableObject {
 
     /// 把一轮请求的 usage 记到会话和全局。服务端偶尔回 0（比如流被中断），
     /// 这种情况跳过，免得把已累计的数字清零。
+    // MARK: - 屏幕识别（由 screen_watch 工具驱动）
+
+    /// 识别是否在跑。
+    @Published var watchActive = false
+    /// 开始识别时需要弹出「解释 + 系统广播按钮」那一页。
+    @Published var showWatchStart = false
+
+    private var watchPoll: Task<Void, Never>?
+    private var watchBaseline: Double = 0
+
+    /// 把工具调用接到界面动作上。初始化时调用一次。
+    @MainActor
+    private func installWatchBridge() {
+        Tools.watchStart = { [weak self] prompt, interval in
+            guard let self else { return "错误：App 已经关闭。" }
+            return self.beginScreenWatch(prompt: prompt, interval: interval)
+        }
+        Tools.watchStop = { [weak self] in
+            guard let self else { return "错误：App 已经关闭。" }
+            return self.endScreenWatch()
+        }
+        Tools.watchStatus = { [weak self] in
+            guard let self else { return "错误：App 已经关闭。" }
+            return self.screenWatchStatus()
+        }
+    }
+
+    /// 把配置写进 App Group，并弹出「开始直播」那一页（iOS 只允许用户亲手点开始）。
+    func beginScreenWatch(prompt: String, interval: Double) -> String {
+        let key = Keychain.loadAPIKey()
+        guard !key.isEmpty else {
+            return "错误：还没设置 DeepSeek API key，识别跑不起来。先让用户去设置里填 key。"
+        }
+        var config = WatchShared.load()
+        config.apiKey = key
+        config.baseURL = baseURL
+        config.model = "deepseek-flash"
+        config.effort = "off"
+        if !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            config.prompt = prompt
+        }
+        config.intervalSeconds = min(5, max(1, interval))
+        config.enabled = true
+        config.notify = true
+        WatchShared.save(config)
+
+        watchActive = true
+        showWatchStart = true
+        requestWatchNotificationPermission()
+        startWatchPolling()
+        return "已准备屏幕识别（flash 模型 + 推理关，每 \(Int(config.intervalSeconds)) 秒一帧）。现在需要用户点一下刚弹出的「开始直播」按钮 —— 这是 iOS 的硬限制，不点的话系统不会把屏幕内容给 App。点完之后就不用管了，识别结果会以通知和对话消息出现。"
+    }
+
+    func endScreenWatch() -> String {
+        var config = WatchShared.load()
+        config.enabled = false
+        WatchShared.save(config)
+        watchPoll?.cancel()
+        watchPoll = nil
+        watchActive = false
+        appendItem(ChatItem(role: .assistant, text: "屏幕识别已结束。", tag: "watch"), to: currentSessionID)
+        return "屏幕识别已停止，产生的记录在对话里折叠成「屏幕识别信息」一组。"
+    }
+
+    private func screenWatchStatus() -> String {
+        let config = WatchShared.load()
+        if watchActive {
+            return "屏幕识别在跑：每 \(Int(config.intervalSeconds)) 秒一帧。要停就调 action=stop。"
+        }
+        return "屏幕识别没在跑。需要时调 action=start。"
+    }
+
+    private func requestWatchNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            Task { @MainActor in
+                self.toast = granted ? "通知权限已允许：识别结果会弹通知" : "通知权限被拒绝：结果只会出现在对话里"
+            }
+        }
+    }
+
+    private func startWatchPolling() {
+        watchPoll?.cancel()
+        watchBaseline = Date().timeIntervalSince1970
+        watchPoll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self else { return }
+                await MainActor.run { self.pollWatchResult() }
+            }
+        }
+    }
+
+    private func pollWatchResult() {
+        guard watchActive, let result = WatchShared.lastResult(), let at = result.at else { return }
+        let stamp = at.timeIntervalSince1970
+        guard stamp > watchBaseline else { return }
+        watchBaseline = stamp
+        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        appendItem(ChatItem(role: .assistant, text: text, tag: "watch"), to: currentSessionID)
+        trimWatchItems()
+    }
+
+    /// 识别会一直产出，超过 80 条就把最老的挤掉，避免会话文件无限长大。
+    private func trimWatchItems() {
+        let sessionID = currentSessionID
+        let watchIDs = sessions.first(where: { $0.id == sessionID })?.items.filter { $0.tag == "watch" }.map { $0.id } ?? []
+        guard watchIDs.count > 80 else { return }
+        let drop = Set(watchIDs.prefix(watchIDs.count - 80))
+        mutate(sessionID) { $0.items.removeAll { drop.contains($0.id) } }
+    }
+
     private func recordTokens(input: Int, output: Int, sessionID: UUID) {
         guard input > 0 || output > 0 else { return }
         mutate(sessionID) {

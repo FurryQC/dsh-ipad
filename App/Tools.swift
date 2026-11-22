@@ -218,6 +218,14 @@ enum Tools {
                 required: []
             ),
             spec(
+                "screen_watch",
+                "开启或结束「屏幕识别」：开启后 App 会每 N 秒截一张屏幕发给 flash 模型看，结果以系统通知和对话消息的形式回给你。用户说「帮我看看屏幕上是什么」「识别一下屏幕」时用它。开启需要用户点一次系统的「开始直播」按钮（iOS 限制，你只需告诉用户去点）。",
+                ["action": ("string", "start 开启，stop 结束，status 查看状态。"),
+                 "prompt": ("string", "希望从屏幕里得到什么，例如「用户在问什么？给出一句回答建议」。"),
+                 "interval": ("number", "间隔秒数，1~5，默认 3。")],
+                required: ["action"]
+            ),
+            spec(
                 "open_settings",
                 "尝试打开系统设置（比如应用存储、通知、隐私页），用于「用户要去做一件 App 里做不到的事」时把用户带到能做的地方。返回是否跳成功和该说的话。",
                 ["section": ("string", "可选，想去的设置分区名，例如 General、STORAGE、PRIVACY、NOTIFICATIONS；留空就打开设置首页。")],
@@ -256,6 +264,13 @@ enum Tools {
             case "copy_path":  return try copyPath(args)
             case "fetch_url":  return try await fetchURL(args)
             case "run_js":     return try runJS(args)
+            case "screen_watch":
+                let action = try string(args, "action", fallback: "status")
+                let prompt = try string(args, "prompt", fallback: "")
+                let interval = double(args, "interval", fallback: 3)
+                return await MainActor.run {
+                    performScreenWatch(action: action, prompt: prompt, interval: interval)
+                }
             case "now":        return nowString()
             case "open_url":   return try await openURL(args)
             case "app_config": return try appConfig(args)
@@ -420,6 +435,33 @@ enum Tools {
         if let value = args[key] as? String, let parsed = Int(value) { return parsed }
         return fallback
     }
+
+    private static func double(_ args: [String: Any], _ key: String, fallback: Double) -> Double {
+        if let value = args[key] as? Double { return value }
+        if let value = args[key] as? Int { return Double(value) }
+        if let value = args[key] as? String, let parsed = Double(value) { return parsed }
+        return fallback
+    }
+
+    /// 屏幕识别的实际起停由 AppModel 接管：工具只负责把动作转过去。
+    @MainActor static var watchStart: ((String, Double) -> String)?
+    @MainActor static var watchStop: (() -> String)?
+    @MainActor static var watchStatus: (() -> String)?
+
+    @MainActor
+    private static func performScreenWatch(action: String, prompt: String, interval: Double) -> String {
+        switch action.lowercased() {
+        case "start":
+            guard let start = watchStart else { return "错误：App 还没准备好屏幕识别。" }
+            return start(prompt, interval)
+        case "stop":
+            guard let stop = watchStop else { return "错误：App 还没准备好屏幕识别。" }
+            return stop()
+        default:
+            return watchStatus?() ?? "错误：App 还没准备好屏幕识别。"
+        }
+    }
+
 
     static func clip(_ text: String) -> String {
         if text.count <= outputLimit { return text }

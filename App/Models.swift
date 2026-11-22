@@ -57,6 +57,8 @@ struct ChatItem: Identifiable, Codable, Hashable {
     var reasoningSignature: String?
     /// 用户消息里带的图片/文件。图片会以 base64 图片块发给模型，文件只作说明。
     var attachments: [AttachmentRef] = []
+    /// 特殊来源标记。目前只有 "watch"：由屏幕识别产生的消息，界面上折叠成一组。
+    var tag: String?
 }
 
 /// 手写解码放在扩展里：扩展不会顶掉结构体的逐成员初始化器，而合成的解码器一旦缺键
@@ -64,7 +66,7 @@ struct ChatItem: Identifiable, Codable, Hashable {
 extension ChatItem {
     private enum CodingKeys: String, CodingKey {
         case id, role, text, toolCalls, toolCallId, toolName
-        case isError, isRunning, reasoning, reasoningSignature, attachments
+        case isError, isRunning, reasoning, reasoningSignature, attachments, tag
     }
 
     /// 每个字段都允许缺失，缺了就用默认值。新增字段之后旧会话文件仍然算合法输入。
@@ -81,6 +83,7 @@ extension ChatItem {
         reasoning = try container.decodeIfPresent(String.self, forKey: .reasoning)
         reasoningSignature = try container.decodeIfPresent(String.self, forKey: .reasoningSignature)
         attachments = try container.decodeIfPresent([AttachmentRef].self, forKey: .attachments) ?? []
+        tag = try container.decodeIfPresent(String.self, forKey: .tag)
     }
 }
 

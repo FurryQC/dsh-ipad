@@ -25,8 +25,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc
         PRODUCT_NAME: DSH
         # 版本名由用户指定（每轮交付前问一次）。b21 = 第 21 个构建。
-        MARKETING_VERSION: "b21"
-        CURRENT_PROJECT_VERSION: "21"
+        MARKETING_VERSION: "b22"
+        CURRENT_PROJECT_VERSION: "22"
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
@@ -54,8 +54,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc.broadcast
         PRODUCT_NAME: DSHBroadcast
-        MARKETING_VERSION: "b21"
-        CURRENT_PROJECT_VERSION: "21"
+        MARKETING_VERSION: "b22"
+        CURRENT_PROJECT_VERSION: "22"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         INFOPLIST_FILE: BroadcastExtension/Info.plist

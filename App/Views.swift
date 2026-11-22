@@ -85,6 +85,12 @@ struct RootView: View {
                 }
                 .ignoresSafeArea()
             }
+            // 屏幕识别需要用户点一次系统广播按钮，这里弹出解释 + 那个按钮。
+            .sheet(isPresented: $model.showWatchStart) {
+                WatchStartSheet()
+                    .environmentObject(model)
+                    .ignoresSafeArea()
+            }
 
             // 启动动画盖在最上层，自己跑完 1.66 秒后回调。下面这层透明蒙板拦住这期间的触摸。
             if showSplash {
@@ -492,8 +498,10 @@ struct ChatCard: View {
         var rows: [MessageRowGroup] = []
         var bucket: [ChatItem] = []
         var bucketID: UUID?
+        var watchBucket: [ChatItem] = []
+        var watchID: UUID?
 
-        func flush() {
+        func flushProcess() {
             if let id = bucketID, !bucket.isEmpty {
                 rows.append(.process(id, bucket))
             }
@@ -501,17 +509,33 @@ struct ChatCard: View {
             bucketID = nil
         }
 
+        func flushWatch() {
+            if let id = watchID, !watchBucket.isEmpty {
+                rows.append(.watch(id, watchBucket))
+            }
+            watchBucket = []
+            watchID = nil
+        }
+
         for item in model.currentItems {
+            if item.tag == "watch" {
+                flushProcess()
+                if watchID == nil { watchID = UUID() }
+                watchBucket.append(item)
+                continue
+            }
+            flushWatch()
             let isProcess = item.role == .tool || !item.toolCalls.isEmpty
             if isProcess {
                 if bucketID == nil { bucketID = UUID() }
                 bucket.append(item)
             } else {
-                flush()
+                flushProcess()
                 rows.append(.single(item))
             }
         }
-        flush()
+        flushProcess()
+        flushWatch()
         return rows
     }
 
@@ -543,6 +567,8 @@ struct ChatCard: View {
                                          seconds: seconds(for: row),
                                          isRunning: model.isRunning && id == lastProcessID)
                                 .id(id)
+                        case .watch(let id, let items):
+                            WatchGroup(items: items).id(id)
                         }
                     }
                     if model.isRunning && !model.reasoningPreview.isEmpty {
@@ -898,6 +924,8 @@ struct ProcessGroup: View {
 enum MessageRowGroup: Identifiable {
     case single(ChatItem)
     case process(UUID, [ChatItem])
+    /// 屏幕识别产生的连续消息，折叠成一组。
+    case watch(UUID, [ChatItem])
 
     var id: UUID {
         switch self {
@@ -905,7 +933,63 @@ enum MessageRowGroup: Identifiable {
             return item.id
         case .process(let id, _):
             return id
+        case .watch(let id, _):
+            return id
         }
+    }
+}
+
+/// 屏幕识别产生的消息：默认折叠，只露一行「屏幕识别信息」。
+struct WatchGroup: View {
+    let items: [ChatItem]
+    @State private var expanded = false
+
+    private var title: String { "屏幕识别信息 · \(items.count) 条" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "viewfinder")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(title)
+                        .font(.system(size: 12, weight: .medium))
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(Theme.textTertiary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(items) { item in
+                        Text(item.text.isEmpty ? "（空）" : item.text)
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 10)
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Theme.accent.opacity(0.22), lineWidth: 1)
+        )
     }
 }
 
