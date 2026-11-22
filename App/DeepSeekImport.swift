@@ -228,7 +228,7 @@ final class ZipReader {
         var output = [UInt8](repeating: 0, count: uncompressedSize)
         let written: Int = payload.withUnsafeBytes { (source: UnsafeRawBufferPointer) -> Int in
             guard let sourceBase = source.bindMemory(to: UInt8.self).baseAddress else { return 0 }
-            return output.withUnsafeMutableBufferPointer { (target: UnsafeMutableBufferPointer<UInt8>) -> Int in
+            return output.withUnsafeMutableBufferPointer { target -> Int in
                 guard let targetBase = target.baseAddress else { return 0 }
                 return compression_decode_buffer(targetBase,
                                                  target.count,
@@ -383,7 +383,7 @@ enum DeepSeekImport {
         var items: [ChatItem] = []
         var tokenOut = 0
         for message in file.messages ?? [] {
-            tokenOut += message.accumulatorTokenUsage ?? 0
+            tokenOut += message.accumulatedTokenUsage ?? 0
             let fragments = message.fragments ?? []
             let role = message.role ?? ""
             let chatRole: ChatRole
