@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - 悬浮面板
 
@@ -209,6 +210,7 @@ struct ChatCard: View {
         VStack(spacing: 0) {
             topBar
             if model.isRunning && mode == .work { runningBanner }
+            if mode == .chat && !model.isRunning { chatHint }
             if let text = model.errorText { errorBanner(text) }
             messageList
             composer
@@ -242,8 +244,28 @@ struct ChatCard: View {
         }
     }
 
-    // MARK: 顶栏
+    /// 对话模式不加载工具，这里给一条可点的提示，避免用户以为工具坏了。
+    private var chatHint: some View {
+        Button {
+            model.setMode(.work)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "hammer")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("对话模式不带工具，点这里切到工作模式")
+                    .font(.system(size: 12))
+                Spacer(minLength: 0)
+            }
+            .foregroundColor(Theme.warning)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(Theme.warning.opacity(0.10))
+    }
 
+    // MARK: 顶栏
     private var topBar: some View {
         HStack(spacing: 8) {
             if !showSidebar {
@@ -714,6 +736,9 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showKey = false
     @State private var keyError: String?
+    @State private var mounts: [MountedFolder] = []
+    @State private var showFolderPicker = false
+    @State private var mountError: String?
 
     var body: some View {
         NavigationView {
@@ -806,10 +831,38 @@ struct SettingsView: View {
                     Button("复制目录路径") {
                         UIPasteboard.general.string = Workspace.root.path
                     }
+                    Button {
+                        showFolderPicker = true
+                    } label: {
+                        Label("添加外部文件夹", systemImage: "folder.badge.plus")
+                    }
+                    if mounts.isEmpty {
+                        Text("还没有授权外部文件夹。加一个之后，模型就能用 mount:<名字>/... 读写它。")
+                            .font(.system(size: 13))
+                            .foregroundColor(Theme.textTertiary)
+                    } else {
+                        ForEach(mounts) { mount in
+                            HStack {
+                                Image(systemName: "externaldrive")
+                                    .foregroundColor(Theme.accent)
+                                Text("mount:\(mount.name)")
+                                    .font(.system(.body, design: .monospaced))
+                                Spacer()
+                                Button {
+                                    MountStore.shared.remove(id: mount.id)
+                                    mounts = MountStore.shared.mounts
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .foregroundColor(Theme.danger)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
                 } header: {
                     Text("文件")
                 } footer: {
-                    Text("在「文件」App 的「我的 iPad」里能看到 DSH 文件夹。")
+                    Text("在「文件」App 的「我的 iPad」里能看到 DSH 文件夹。外部文件夹在这里手动授权：选 iCloud 云盘、我的 iPad 或其它 App 暴露的目录都行，授权会一直有效，直到你删掉它。")
                 }
 
                 Section {
@@ -822,6 +875,31 @@ struct SettingsView: View {
             }
             .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { mounts = MountStore.shared.mounts }
+            .fileImporter(isPresented: $showFolderPicker,
+                          allowedContentTypes: [.folder],
+                          allowsMultipleSelection: false) { result in
+                switch result {
+                case .success(let urls):
+                    guard let url = urls.first else { return }
+                    do {
+                        _ = try MountStore.shared.add(url: url)
+                        mounts = MountStore.shared.mounts
+                    } catch {
+                        mountError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    }
+                case .failure(let error):
+                    mountError = error.localizedDescription
+                }
+            }
+            .alert("文件夹没授权上", isPresented: Binding(
+                get: { mountError != nil },
+                set: { if !$0 { mountError = nil } }
+            )) {
+                Button("知道了", role: .cancel) { mountError = nil }
+            } message: {
+                Text(mountError ?? "")
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
