@@ -857,8 +857,15 @@ final class AppModel: ObservableObject {
     /// 开始识别时需要弹出「解释 + 系统广播按钮」那一页。
     @Published var showWatchStart = false
 
+    /// 已经收到的帧数、最近一帧到达时间（给设置页和工具状态看）。
+    @Published private(set) var watchFrames = 0
+    @Published private(set) var watchLastFrameAt: Date?
+
     private var watchPoll: Task<Void, Never>?
-    private var watchBaseline: Double = 0
+    /// 上一次已经发出去识别的那帧时间戳，用来去重。
+    private var lastFrameStamp: Double = 0
+    /// 上一次识别还没回来就不再发新帧，避免堆积。
+    private var watchInFlight = false
 
     /// 把工具调用接到界面动作上。初始化时调用一次。
     @MainActor
@@ -895,12 +902,16 @@ final class AppModel: ObservableObject {
         config.enabled = true
         config.notify = true
         WatchShared.save(config)
+        WatchShared.clearFrames()
 
+        watchFrames = 0
+        watchLastFrameAt = nil
+        lastFrameStamp = 0
         watchActive = true
         showWatchStart = true
         requestWatchNotificationPermission()
         startWatchPolling()
-        return "已准备屏幕识别（flash 模型 + 推理关，每 \(Int(config.intervalSeconds)) 秒一帧）。现在需要用户点一下刚弹出的「开始直播」按钮 —— 这是 iOS 的硬限制，不点的话系统不会把屏幕内容给 App。点完之后就不用管了，识别结果会以通知和对话消息出现。"
+        return "已准备好屏幕识别（flash 模型 + 推理关，每 \(Int(config.intervalSeconds)) 秒取一帧）。现在界面上已经弹出「开始直播」那一页，需要用户亲手点一下里面的圆钮 —— 这是 iOS 的硬限制。点完之后请再调一次 action=status 确认收到画面；在拿到帧之前，不要对用户说「没开启」或「失败」，那只是用户还没点按钮。"
     }
 
     func endScreenWatch() -> String {
@@ -910,16 +921,23 @@ final class AppModel: ObservableObject {
         watchPoll?.cancel()
         watchPoll = nil
         watchActive = false
+        watchInFlight = false
+        WatchShared.clearFrames()
         appendItem(ChatItem(role: .assistant, text: "屏幕识别已结束。", tag: "watch"), to: currentSessionID)
         return "屏幕识别已停止，产生的记录在对话里折叠成「屏幕识别信息」一组。"
     }
 
     private func screenWatchStatus() -> String {
         let config = WatchShared.load()
-        if watchActive {
-            return "屏幕识别在跑：每 \(Int(config.intervalSeconds)) 秒一帧。要停就调 action=stop。"
+        if !watchActive {
+            return "屏幕识别没在跑。需要时调 action=start。"
         }
-        return "屏幕识别没在跑。需要时调 action=start。"
+        let group = WatchShared.groupAvailable ? "可用" : "不可用"
+        if let last = watchLastFrameAt {
+            let ago = Int(Date().timeIntervalSince(last))
+            return "屏幕识别在跑：已收到 \(watchFrames) 帧，最近一帧 \(ago) 秒前，每 \(Int(config.intervalSeconds)) 秒取一帧。共享容器：\(group)。要停就调 action=stop。"
+        }
+        return "已准备好，但还没收到任何画面（0 帧）。这通常表示用户还没点系统里那个「开始直播」圆钮 —— 不要判定失败，先提醒用户点一下，再调一次 status。共享容器：\(group)。"
     }
 
     private func requestWatchNotificationPermission() {
@@ -932,25 +950,66 @@ final class AppModel: ObservableObject {
 
     private func startWatchPolling() {
         watchPoll?.cancel()
-        watchBaseline = Date().timeIntervalSince1970
         watchPoll = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
                 guard let self else { return }
-                await MainActor.run { self.pollWatchResult() }
+                await MainActor.run { self.pollWatchFrames() }
             }
         }
     }
 
-    private func pollWatchResult() {
-        guard watchActive, let result = WatchShared.lastResult(), let at = result.at else { return }
-        let stamp = at.timeIntervalSince1970
-        guard stamp > watchBaseline else { return }
-        watchBaseline = stamp
-        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        appendItem(ChatItem(role: .assistant, text: text, tag: "watch"), to: currentSessionID)
-        trimWatchItems()
+    /// 主 App 从共享容器读扩展写下的帧，自己发请求、自己出结果 —— 扩展只负责截图。
+    private func pollWatchFrames() {
+        guard watchActive, !watchInFlight, let frame = WatchShared.takeFrame(after: lastFrameStamp) else { return }
+        lastFrameStamp = frame.stamp
+        watchFrames += 1
+        watchLastFrameAt = Date(timeIntervalSince1970: frame.stamp)
+        watchInFlight = true
+
+        var config = WatchShared.load()
+        config.apiKey = Keychain.loadAPIKey()
+        config.baseURL = baseURL
+        config.model = "deepseek-flash"
+        config.effort = "off"
+        let jpegBase64 = frame.jpeg.base64EncodedString()
+        let sessionID = currentSessionID
+
+        Task { [weak self] in
+            let outcome: Result<String, Error>
+            do {
+                outcome = .success(try await WatchVision.ask(jpegBase64: jpegBase64, config: config))
+            } catch {
+                outcome = .failure(error)
+            }
+            await MainActor.run {
+                guard let self else { return }
+                self.watchInFlight = false
+                switch outcome {
+                case .success(let text):
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { return }
+                    WatchShared.recordResult(trimmed)
+                    self.appendItem(ChatItem(role: .assistant, text: trimmed, tag: "watch"), to: sessionID)
+                    self.trimWatchItems()
+                    self.postWatchNotification(trimmed)
+                case .failure(let error):
+                    let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.appendItem(ChatItem(role: .assistant, text: "屏幕识别失败：" + message, tag: "watch"), to: sessionID)
+                    self.trimWatchItems()
+                }
+            }
+        }
+    }
+
+    private func postWatchNotification(_ text: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "DSH 屏幕识别"
+        content.body = String(text.prefix(300))
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        )
     }
 
     /// 识别会一直产出，超过 80 条就把最老的挤掉，避免会话文件无限长大。

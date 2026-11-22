@@ -3,17 +3,18 @@ import ReplayKit
 import UIKit
 import UserNotifications
 
-/// 屏幕广播扩展：系统把屏幕画面按帧喂进来，这里按间隔抽一帧 → 交给 DeepSeek 识别 → 发本地通知。
+/// 屏幕广播扩展：只做一件事 —— 按间隔把一帧 JPEG 落进 App Group 共享容器。
 ///
-/// 独立进程，读不到主 App 的 UserDefaults / 钥匙串，所以配置与 key 都从 App Group 容器取。
-/// 起步阶段每一步都发一条本地通知：这样即使共享容器不通，用户也能看出扩展有没有真的跑起来。
+/// 真正的网络请求由主 App 发（主 App 有钥匙串、有会话、能发通知），
+/// 扩展里不碰 API key，也就少一处「读不到配置就整条链路静默失败」的坑。
 final class SampleHandler: RPBroadcastSampleHandler {
     private let ciContext = CIContext(options: nil)
-    private var lastSentAt = Date.distantPast
-    private var inFlight = false
+    private var lastFrameAt = Date.distantPast
     private var frameCount = 0
+    private var writtenCount = 0
     private var lastDiagWrite = Date.distantPast
     private var announcedFirstFrame = false
+    private var announcedFirstWrite = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         let config = WatchShared.load()
@@ -23,23 +24,18 @@ final class SampleHandler: RPBroadcastSampleHandler {
             diag.configEnabled = config.enabled
             diag.frames = 0
             diag.sent = 0
-            diag.lastError = config.enabled
-                ? "广播已启动，等第一帧"
-                : "扩展起来了但读到的配置是「未启用」—— 多半是重签时没给扩展加 App Group（group.com.dsh.qc）"
+            diag.lastError = config.enabled ? "广播已启动，等第一帧" : "扩展起来了但配置读到的是「未启用」"
         }
-        // 这条通知是「扩展到底有没有被系统拉起来」的唯一可靠证据：它不依赖 App Group。
-        var body = "扩展已启动。配置：\(config.enabled ? "读到" : "没读到")；共享容器：\(groupOK ? "可用" : "不可用")。"
-        if !config.enabled {
-            body += "请回到 App 的「屏幕识别」页点一下保存，再重新开始广播。"
-        }
+        // 这条通知是「扩展有没有被系统拉起来」最可靠的证据：它不依赖 App Group。
+        let body = "扩展已启动。共享容器：\(groupOK ? "可用" : "不可用")；配置：\(config.enabled ? "已启用" : "未启用")。"
         Self.notifyNow("DSH 屏幕识别 · 扩展已启动", body)
     }
 
     override func broadcastFinished() {
         WatchShared.updateDiag { diag in
-            diag.lastError = "广播已停止（收到 \(diag.frames) 帧，发出 \(diag.sent) 次）"
+            diag.lastError = "广播已停止（收到 \(diag.frames) 帧，写入 \(self.writtenCount) 帧）"
         }
-        Self.notifyNow("DSH 屏幕识别 · 已停止", "收到 \(frameCount) 帧画面。")
+        Self.notifyNow("DSH 屏幕识别 · 已停止", "收到 \(frameCount) 帧画面，写入共享容器 \(writtenCount) 帧。")
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
@@ -51,44 +47,26 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         if frameCount == 1 && !announcedFirstFrame {
             announcedFirstFrame = true
-            Self.notifyNow("DSH 屏幕识别 · 收到画面",
-                           "第 1 帧已到达。配置：\(config.enabled ? "已启用" : "未启用（读不到 App Group 配置）")")
+            Self.notifyNow("DSH 屏幕识别 · 收到画面", "第 1 帧已到达，正在按间隔写入共享容器。")
         }
 
-        guard config.enabled else { return }
-        guard !inFlight else { return }
+        // 配置读不到也照写：只要共享容器通着，主 App 就能拿到画面；
+        // 容器不通的话 writeFrame 返回 false，诊断里会记下来。
         let interval = max(1.0, min(5.0, config.intervalSeconds))
-        guard Date().timeIntervalSince(lastSentAt) >= interval else { return }
+        guard Date().timeIntervalSince(lastFrameAt) >= interval else { return }
         guard let jpeg = Self.makeJPEG(from: sampleBuffer, context: ciContext) else {
-            WatchShared.updateDiag { $0.lastError = "帧转 JPEG 失败（收到 \(self.frameCount) 帧但转不出来）" }
+            WatchShared.updateDiag { $0.lastError = "帧转 JPEG 失败（收到 \(self.frameCount) 帧）" }
             return
         }
-
-        lastSentAt = Date()
-        inFlight = true
-        let framesNow = frameCount
-        Task {
-            defer { inFlight = false }
-            do {
-                let text = try await WatchVision.ask(jpegBase64: jpeg.base64EncodedString(), config: config)
-                WatchShared.recordResult(text)
-                WatchShared.updateDiag { diag in
-                    diag.groupOK = WatchShared.groupAvailable
-                    diag.configEnabled = true
-                    diag.frames = framesNow
-                    diag.sent += 1
-                    diag.lastError = ""
-                }
-                await Self.postNotification(text, config: config)
-            } catch {
-                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                WatchShared.recordResult("错误：" + message)
-                WatchShared.updateDiag { diag in
-                    diag.frames = framesNow
-                    diag.lastError = "识别失败：" + message
-                }
-                await Self.postNotification("识别失败：" + message, config: config)
+        lastFrameAt = Date()
+        if WatchShared.writeFrame(jpeg) {
+            writtenCount += 1
+            if !announcedFirstWrite {
+                announcedFirstWrite = true
+                Self.notifyNow("DSH 屏幕识别 · 画面已写入", "主 App 会读走它、发给模型。")
             }
+        } else {
+            WatchShared.updateDiag { $0.lastError = "写不进共享容器 —— 重签时多半没给扩展加 App Group（group.com.dsh.qc）" }
         }
     }
 
@@ -98,12 +76,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard now.timeIntervalSince(lastDiagWrite) > 2 else { return }
         lastDiagWrite = now
         let framesNow = frameCount
+        let writtenNow = writtenCount
         WatchShared.updateDiag { diag in
             diag.groupOK = WatchShared.groupAvailable
             diag.configEnabled = config.enabled
             diag.frames = framesNow
+            diag.sent = writtenNow
             if !config.enabled && diag.lastError.isEmpty {
-                diag.lastError = "读到的配置是「未启用」—— App Group 可能没生效"
+                diag.lastError = "配置读到的是「未启用」"
             }
         }
     }
@@ -127,19 +107,5 @@ final class SampleHandler: RPBroadcastSampleHandler {
         content.sound = .default
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
-    }
-
-    private static func postNotification(_ text: String, config: WatchShared.Config) async {
-        guard config.notify else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "DSH 屏幕识别"
-        content.body = String(text.prefix(300))
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        do {
-            try await UNUserNotificationCenter.current().add(request)
-        } catch {
-            // 扩展里加不了通知（权限没给或系统限制）时，内容已经在 App Group 里，主 App 能看到。
-        }
     }
 }

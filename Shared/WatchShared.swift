@@ -92,6 +92,59 @@ enum WatchShared {
     static func clearDiag() {
         defaults.removeObject(forKey: diagKey)
     }
+
+    // MARK: - 帧通道（扩展 → 主 App）
+
+    /// App Group 容器的真实路径；没生效时是 nil。
+    static var containerURL: URL? {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: suiteName)
+    }
+
+    private static var framesDirectory: URL? {
+        guard let base = containerURL else { return nil }
+        let dir = base.appendingPathComponent("frames", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// 扩展把一帧 JPEG 落进共享容器，并写一个时间戳；主 App 靠时间戳判断是不是新帧。
+    @discardableResult
+    static func writeFrame(_ jpeg: Data) -> Bool {
+        guard let dir = framesDirectory else { return false }
+        let stamp = Date().timeIntervalSince1970
+        let image = dir.appendingPathComponent("latest.jpg")
+        let meta = dir.appendingPathComponent("latest.stamp")
+        do {
+            try jpeg.write(to: image, options: .atomic)
+            try Data(String(stamp).utf8).write(to: meta, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 主 App 取最新一帧；时间戳不大于 `after` 就返回 nil（没有新帧）。
+    static func takeFrame(after lastStamp: Double) -> (jpeg: Data, stamp: Double)? {
+        guard let dir = framesDirectory else { return nil }
+        let meta = dir.appendingPathComponent("latest.stamp")
+        let image = dir.appendingPathComponent("latest.jpg")
+        guard let metaData = try? Data(contentsOf: meta),
+              let text = String(data: metaData, encoding: .utf8),
+              let stamp = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              stamp > lastStamp,
+              let jpeg = try? Data(contentsOf: image) else { return nil }
+        return (jpeg, stamp)
+    }
+
+    /// 停止时清掉残留帧，避免下次启动把旧画面当新帧发出去。
+    static func clearFrames() {
+        guard let dir = framesDirectory else { return }
+        for name in ["latest.jpg", "latest.stamp"] {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
 }
 
 /// 截帧识别用的最小 Messages API 客户端（扩展现程里跑，不依赖主 App 的 MessagesAPI）。
