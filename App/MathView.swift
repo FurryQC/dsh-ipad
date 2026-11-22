@@ -2,7 +2,8 @@ import SwiftUI
 import Foundation
 
 /// 公式语法树：TeX 子集解析后只会落成这几种节点，渲染层按类型分派。
-enum MathNode {
+/// 递归节点（row/frac/sqrt/script/delimited）自带子节点，所以整个枚举标 indirect。
+indirect enum MathNode {
     /// 正体文本：数字、运算符、text 命令的内容，以及未知命令的兜底。
     case text(String)
 
