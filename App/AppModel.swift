@@ -1064,6 +1064,8 @@ final class AppModel: ObservableObject {
         config.notify = true
         WatchShared.save(config)
         WatchShared.clearFrames()
+        // 扩展读不到 App Group 时用这条 loopback 通道取配置（重签后 entitlement 常丢）。
+        WatchConfigServer.shared.serve(config)
 
         watchFrames = 0
         watchLastFrameAt = nil
@@ -1084,6 +1086,7 @@ final class AppModel: ObservableObject {
         watchActive = false
         watchInFlight = false
         WatchShared.clearFrames()
+        WatchConfigServer.shared.stop()
         appendItem(ChatItem(role: .assistant, text: "屏幕识别已结束。", tag: "watch"), to: currentSessionID)
         return "屏幕识别已停止，产生的记录在对话里折叠成「屏幕识别信息」一组。"
     }
