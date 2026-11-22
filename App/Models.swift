@@ -23,6 +23,10 @@ struct ChatItem: Identifiable, Codable, Hashable {
     var toolName: String?
     var isError: Bool = false
     var isRunning: Bool = false
+    /// 推理正文。开着推理等级时服务端会回传，展示在「思考」折叠区。
+    var reasoning: String?
+    /// 推理块的签名。回放历史时必须原样带回，否则服务端拒绝。
+    var reasoningSignature: String?
 }
 
 struct ChatSession: Identifiable, Codable {
@@ -33,31 +37,6 @@ struct ChatSession: Identifiable, Codable {
 }
 
 // MARK: - API 传输结构
-
-struct WireFunction: Codable {
-    var name: String
-    var arguments: String
-}
-
-struct WireToolCall: Codable {
-    var id: String
-    var type: String = "function"
-    var function: WireFunction
-}
-
-struct WireMessage: Codable {
-    var role: String
-    var content: String?
-    var tool_calls: [WireToolCall]?
-    var tool_call_id: String?
-
-    init(role: String, content: String? = nil, tool_calls: [WireToolCall]? = nil, tool_call_id: String? = nil) {
-        self.role = role
-        self.content = content
-        self.tool_calls = tool_calls
-        self.tool_call_id = tool_call_id
-    }
-}
 
 struct ToolProperty: Codable {
     var type: String
@@ -79,43 +58,4 @@ struct ToolSpecFunction: Codable {
 struct ToolSpec: Codable {
     var type: String = "function"
     var function: ToolSpecFunction
-}
-
-struct ChatRequest: Encodable {
-    var model: String
-    var messages: [WireMessage]
-    var tools: [ToolSpec]
-    var tool_choice: String
-    var stream: Bool
-}
-
-struct StreamFunctionDelta: Decodable {
-    var name: String?
-    var arguments: String?
-}
-
-struct StreamToolCallDelta: Decodable {
-    var index: Int?
-    var id: String?
-    var function: StreamFunctionDelta?
-}
-
-struct StreamDelta: Decodable {
-    var content: String?
-    var tool_calls: [StreamToolCallDelta]?
-}
-
-struct StreamChoice: Decodable {
-    var delta: StreamDelta?
-    var finish_reason: String?
-}
-
-struct StreamChunk: Decodable {
-    var choices: [StreamChoice]?
-}
-
-/// 一次模型回复：文本 + 要执行的工具调用。
-struct AssistantTurn {
-    var text: String
-    var toolCalls: [ToolCall]
 }
