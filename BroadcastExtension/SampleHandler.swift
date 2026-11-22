@@ -26,9 +26,27 @@ final class SampleHandler: RPBroadcastSampleHandler {
             diag.sent = 0
             diag.lastError = config.enabled ? "广播已启动，等第一帧" : "扩展起来了但配置读到的是「未启用」"
         }
-        // 这条通知是「扩展有没有被系统拉起来」最可靠的证据：它不依赖 App Group。
-        let body = "扩展已启动。共享容器：\(groupOK ? "可用" : "不可用")；配置：\(config.enabled ? "已启用" : "未启用")。"
-        Self.notifyNow("DSH 屏幕识别 · 扩展已启动", body)
+
+        // 这两条错误会由系统弹给用户，是「扩展到底跑没跑起来 / 能不能读到配置」最直接的证据：
+        // 弹出来说明扩展活了；连弹窗都没有说明扩展根本没被系统拉起（重签时 appex 没签好）。
+        if !groupOK {
+            finishBroadcastWithError(Self.watchError(
+                "扩展已启动，但拿不到 App Group（group.com.dsh.qc）。重签时请把 group.com.dsh.qc 同时加到 com.dsh.qc 和 com.dsh.qc.broadcast。"
+            ))
+            return
+        }
+        if !config.enabled {
+            finishBroadcastWithError(Self.watchError(
+                "扩展已启动、共享容器正常，但配置读到的是「未启用」。回 App 的屏幕识别页点一次「保存配置」，再回来开始广播。"
+            ))
+            return
+        }
+
+        Self.notifyNow("DSH 屏幕识别 · 扩展已启动", "共享容器可用；配置已启用，等第一帧画面。")
+    }
+
+    private static func watchError(_ message: String) -> NSError {
+        NSError(domain: "com.dsh.qc.broadcast", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     override func broadcastFinished() {
