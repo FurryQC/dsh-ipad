@@ -1063,18 +1063,16 @@ struct AttachmentPanel: View {
                     panelButton("拍照", systemImage: "camera")
                 }
                 Button {
-                    // 先收起附件面板，再让 RootView 在最高层弹系统选择器。
-                    dismiss()
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 350_000_000)
-                        model.pickerRequest = .files
-                    }
+                    // 面板自己就是一张 sheet，再从它上面弹系统选择器是允许的（iPadOS 会叠加显示）。
+                    showFiles = true
                 } label: {
                     panelButton("文件", systemImage: "paperclip")
                 }
             }
             .padding(.horizontal, 18)
-            Text("图片会先缩到 2048 长边再传（flash 模型能直接看图）；文件会复制进工作目录，agent 能用 read_file 读。")
+            // 兜底入口：文件选择器万一用不了，也能从 App 自己的工作目录里挑文件。
+            workspacePicker
+            Text("图片会先缩到 2048 长边再传（flash 模型能直接看图）；文件会复制进工作目录，agent 能用 read_file 读。也可以把文件拖进「文件」App 的 DSH/Documents 里，这里会列出来。")
                 .font(.system(size: 12))
                 .foregroundColor(Theme.textTertiary)
                 .multilineTextAlignment(.center)
@@ -1099,13 +1097,12 @@ struct AttachmentPanel: View {
             }
             .ignoresSafeArea()
         }
-        // 用自己包的 UIDocumentPicker 而不是 .fileImporter：附件面板本身是一张 sheet，
-        // 从 sheet 里再触发 fileImporter 会撞上「已经有界面在展示」，表现就是点了没反应。
         .sheet(isPresented: $showFiles) {
             DocumentPicker(mode: .files) { urls in
                 showFiles = false
                 guard !urls.isEmpty else { return }
-                for url in urls { ingestFile(url) }
+                // 统一交给 AppModel：它负责安全作用域访问、iCloud 下载兜底和 toast 反馈。
+                model.handlePicked(urls, folders: false)
                 dismiss()
             }
             .ignoresSafeArea()
@@ -1115,6 +1112,52 @@ struct AttachmentPanel: View {
         } message: {
             Text(errorText ?? "")
         }
+    }
+
+    /// 工作目录里的文件（含用户从「文件」App 拖进 DSH/Documents 的），点一下直接当附件。
+    @ViewBuilder private var workspacePicker: some View {
+        let files = workspaceFiles()
+        if !files.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("工作目录里的文件")
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.textTertiary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(files, id: \.absoluteString) { url in
+                            Button {
+                                model.addAttachment(from: url)
+                                dismiss()
+                            } label: {
+                                Text(url.lastPathComponent)
+                                    .font(.system(size: 11))
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Capsule().fill(Color.white.opacity(0.10)))
+                                    .foregroundColor(Theme.textPrimary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                }
+            }
+        }
+    }
+
+    private func workspaceFiles() -> [URL] {
+        let fm = FileManager.default
+        var result: [URL] = []
+        func collect(_ dir: URL) {
+            guard let items = try? fm.contentsOfDirectory(at: dir,
+                                                          includingPropertiesForKeys: [.isDirectoryKey],
+                                                          options: [.skipsHiddenFiles]) else { return }
+            result.append(contentsOf: items.filter { !$0.hasDirectoryPath })
+        }
+        collect(Workspace.root)
+        collect(Workspace.root.deletingLastPathComponent())
+        return Array(result.prefix(20))
     }
 
     private func panelButton(_ title: String, systemImage: String) -> some View {
@@ -1291,6 +1334,14 @@ struct SettingsView: View {
     @State private var showKey = false
     @State private var keyError: String?
     @State private var mounts: [MountedFolder] = []
+
+    /// 设置页底部显示的版本号，用来区分装的是哪一版。
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(short) (\(build))"
+    }
     @State private var showFolderPicker = false
     @State private var mountError: String?
     @State private var showWallpaperSheet = false
@@ -1478,6 +1529,16 @@ struct SettingsView: View {
                         .foregroundColor(Theme.textSecondary)
                 } header: {
                     Text("能力边界")
+                }
+
+                Section {
+                    HStack {
+                        Text("版本")
+                        Spacer()
+                        Text(appVersion)
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(Theme.textSecondary)
+                    }
                 }
             }
             // 设置页做成一层磨砂玻璃：底下透出主界面的壁纸，行背景交给系统行本身。
