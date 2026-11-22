@@ -18,10 +18,11 @@ targets:
     # 这里只通过 INFOPLIST_FILE 指向仓库里那份，保持单一来源。
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.dsh.ipad
+        PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc
         PRODUCT_NAME: DSH
-        MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "15"
+        # 版本名由用户指定（每轮交付前问一次）。b20 = 第 20 个构建。
+        MARKETING_VERSION: "b20"
+        CURRENT_PROJECT_VERSION: "20"
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
