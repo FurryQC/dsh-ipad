@@ -2,6 +2,9 @@ import SwiftUI
 import UIKit
 import PhotosUI
 import ImageIO
+import AVFoundation
+import UniformTypeIdentifiers
+import Foundation
 
 /// 壁纸的显示参数。跟设备走，存 UserDefaults。
 struct WallpaperSettings: Codable, Equatable {
@@ -9,8 +12,44 @@ struct WallpaperSettings: Codable, Equatable {
     var blur: Double = 6
     /// 暗化遮罩 0...0.8。默认 0.35，白字压上去也读得清。
     var dim: Double = 0.35
-    /// 有没有可用的壁纸文件。图片可能因为文件被删掉而暂时为空，以这个标记为准。
+    /// 有没有可用的壁纸（照片或视频）。文件可能被删掉而暂时为空，以这个标记为准。
     var hasImage: Bool = false
+    /// 壁纸是不是视频。hasImage 为 true 时它决定用视频还是照片。
+    var hasVideo: Bool = false
+    /// 画面缩放 1...3。1 是铺满并裁切后的原始状态。
+    var scale: Double = 1
+    /// 横向位移，按屏宽的一半归一化，-1...1。
+    var offsetX: Double = 0
+    /// 纵向位移，按屏高的一半归一化，-1...1。
+    var offsetY: Double = 0
+    /// 视频循环起点（秒）。导入后按实际时长夹到 0...10。
+    var startSecond: Double = 0
+
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case blur
+        case dim
+        case hasImage
+        case hasVideo
+        case scale
+        case offsetX
+        case offsetY
+        case startSecond
+    }
+
+    /// 旧版本只存了 blur / dim / hasImage。缺的字段补默认值，升级后壁纸不能凭空消失。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        blur = try container.decodeIfPresent(Double.self, forKey: .blur) ?? 6
+        dim = try container.decodeIfPresent(Double.self, forKey: .dim) ?? 0.35
+        hasImage = try container.decodeIfPresent(Bool.self, forKey: .hasImage) ?? false
+        hasVideo = try container.decodeIfPresent(Bool.self, forKey: .hasVideo) ?? false
+        scale = try container.decodeIfPresent(Double.self, forKey: .scale) ?? 1
+        offsetX = try container.decodeIfPresent(Double.self, forKey: .offsetX) ?? 0
+        offsetY = try container.decodeIfPresent(Double.self, forKey: .offsetY) ?? 0
+        startSecond = try container.decodeIfPresent(Double.self, forKey: .startSecond) ?? 0
+    }
 }
 
 /// 壁纸读写的失败原因。直接把它显示给用户，不把底层错误文本端上去。
@@ -24,7 +63,7 @@ enum WallpaperError: LocalizedError {
     }
 }
 
-/// 自定义壁纸的唯一入口。图片存沙盒，设置存 UserDefaults；视图通过 @ObservedObject 跟着刷新。
+/// 自定义壁纸的唯一入口。照片/视频存沙盒，设置存 UserDefaults；视图通过 @ObservedObject 跟着刷新。
 @MainActor
 final class WallpaperStore: ObservableObject {
     static let shared = WallpaperStore()
@@ -34,8 +73,11 @@ final class WallpaperStore: ObservableObject {
         didSet { persistSettings() }
     }
 
-    /// 已经解码好的壁纸图。缓存一份，免得每次重绘都从磁盘读 JPEG。
+    /// 已经解码好的壁纸图。缓存一份，免得每次重绘都从磁盘读 JPEG。视频壁纸时为空。
     @Published var image: UIImage? = nil
+
+    /// 视频总时长（秒）。导入或读回视频后异步量一次，设置页用它限制起点滑杆。
+    @Published var videoDuration: Double = 0
 
     /// 设置键。这点数据不值得单开一个文件。
     private static let settingsKey = "dsh.wallpaper.settings"
@@ -46,28 +88,64 @@ final class WallpaperStore: ObservableObject {
             .appendingPathComponent("wallpaper.jpg")
     }
 
+    /// 视频壁纸固定文件名。导入时不转码：AVPlayer 按内容识别 mov / mp4，扩展名只求稳定。
+    var videoURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("wallpaper.mov")
+    }
+
+    /// 实际能播放的视频地址。标记为视频但文件没了就返回 nil，背景会退回底图。
+    var videoURLForPlayback: URL? {
+        guard settings.hasVideo else { return nil }
+        return FileManager.default.fileExists(atPath: videoURL.path) ? videoURL : nil
+    }
+
+    /// 起点滑杆的上限：最多 10 秒，也绝不越过结尾。
+    var maxStartSecond: Double {
+        guard videoDuration > 0.2 else { return 10 }
+        return min(10, max(0, videoDuration - 0.2))
+    }
+
     init() {
         // 自己先读一次：调用方漏了 load() 也不会显示成没壁纸。重复调用无副作用。
         load()
     }
 
-    /// 启动时调用：读回设置和图片。图片文件不在了就把 hasImage 降回 false，免得背景一直空着。
+    /// 启动时调用：读回设置和文件。文件不在了就把标记降回 false，免得背景一直空着。
     func load() {
         if let data = UserDefaults.standard.data(forKey: WallpaperStore.settingsKey),
            let stored = try? JSONDecoder().decode(WallpaperSettings.self, from: data) {
             settings = stored
         }
 
+        let videoExists = FileManager.default.fileExists(atPath: videoURL.path)
+        if settings.hasVideo && videoExists {
+            image = nil
+            if !settings.hasImage {
+                settings.hasImage = true
+            }
+            refreshVideoDuration()
+            return
+        }
+
         if settings.hasImage,
            let data = try? Data(contentsOf: imageURL),
            let loaded = UIImage(data: data) {
             image = loaded
+            videoDuration = 0
+            if settings.hasVideo {
+                settings.hasVideo = false
+            }
             return
         }
 
         image = nil
+        videoDuration = 0
         if settings.hasImage {
             settings.hasImage = false
+        }
+        if settings.hasVideo {
+            settings.hasVideo = false
         }
     }
 
@@ -82,15 +160,51 @@ final class WallpaperStore: ObservableObject {
         } catch {
             throw WallpaperError.message("壁纸写不进沙盒：\(error.localizedDescription)")
         }
+        // 照片和视频互斥：同一时间只留一种壁纸，背景和设置页的判断才不用两头猜。
+        try? FileManager.default.removeItem(at: videoURL)
         image = UIImage(data: jpeg)
+        videoDuration = 0
+        settings.hasVideo = false
         settings.hasImage = true
     }
 
-    /// 清除壁纸：删文件、关标记。文件本来就不在也当成功。
-    func clear() {
+    /// 导入一段视频：原文件拷进 Documents（不转码），照片壁纸一并清掉。
+    func importVideo(from source: URL) throws {
+        let scoped = source.startAccessingSecurityScopedResource()
+        defer {
+            if scoped {
+                source.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let destination = videoURL
+        do {
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.copyItem(at: source, to: destination)
+        } catch {
+            throw WallpaperError.message("这段视频拷不进沙盒：\(error.localizedDescription)")
+        }
+
         try? FileManager.default.removeItem(at: imageURL)
         image = nil
+        settings.hasVideo = true
+        settings.hasImage = true
+        settings.startSecond = min(settings.startSecond, 10)
+        refreshVideoDuration()
+    }
+
+    /// 清除壁纸：删照片和视频、关标记、画面参数回到原始状态。文件本来就不在也当成功。
+    func clear() {
+        try? FileManager.default.removeItem(at: imageURL)
+        try? FileManager.default.removeItem(at: videoURL)
+        image = nil
+        videoDuration = 0
         settings.hasImage = false
+        settings.hasVideo = false
+        settings.scale = 1
+        settings.offsetX = 0
+        settings.offsetY = 0
+        settings.startSecond = 0
     }
 
     /// 调模糊。夹在 0...24 内：再大壁纸就糊成一块色斑，没有"壁纸"的意义了。
@@ -108,6 +222,26 @@ final class WallpaperStore: ObservableObject {
         UserDefaults.standard.set(data, forKey: WallpaperStore.settingsKey)
     }
 
+    /// 视频时长是异步读的；读到之前起点滑杆按 0...10 给，读到之后收紧。
+    private func refreshVideoDuration() {
+        guard settings.hasVideo else {
+            videoDuration = 0
+            return
+        }
+        let url = videoURL
+        Task { @MainActor in
+            let asset = AVURLAsset(url: url)
+            guard let duration = try? await asset.load(.duration) else { return }
+            let seconds = duration.seconds
+            guard seconds.isFinite, seconds > 0 else { return }
+            self.videoDuration = seconds
+            let limit = self.maxStartSecond
+            if self.settings.startSecond > limit {
+                self.settings.startSecond = limit
+            }
+        }
+    }
+
     /// ImageIO 缩图会顺手按 EXIF 把方向转正，比手绘 UIGraphics 省内存也不容易转错。
     private static func makeWallpaperData(from data: Data) -> Data? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
@@ -123,14 +257,61 @@ final class WallpaperStore: ObservableObject {
     }
 }
 
+/// 壁纸内容层：照片或视频 + 缩放/位移 + 模糊/暗化。全局背景和设置页预览共用，
+/// 免得两处的变换逻辑各写一遍、调完滑杆预览和实际效果对不上。
+struct WallpaperSurface: View {
+    let image: UIImage?
+    let videoURL: URL?
+    let settings: WallpaperSettings
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                ZStack {
+                    if let videoURL = videoURL {
+                        VideoWallpaperView(url: videoURL, startSecond: settings.startSecond)
+                            .frame(width: proxy.size.width, height: proxy.size.height)
+                    } else if let image = image {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: proxy.size.width, height: proxy.size.height)
+                    } else {
+                        Theme.bgGradient
+                    }
+                }
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .scaleEffect(CGFloat(settings.scale))
+                .offset(x: CGFloat(settings.offsetX) * proxy.size.width * 0.5,
+                        y: CGFloat(settings.offsetY) * proxy.size.height * 0.5)
+
+                // 视频层是独立合成的，SwiftUI 的 .blur 对 AVPlayerLayer 内容通常不起作用；
+                // 用毛玻璃盖一层，模糊滑杆对视频也真的看得出效果。
+                if videoURL != nil && settings.blur > 0.5 {
+                    VideoBlurVeil(intensity: settings.blur / 24)
+                        .allowsHitTesting(false)
+                }
+
+                Color.black
+                    .opacity(settings.dim)
+                    .allowsHitTesting(false)
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .clipped()
+        }
+        .blur(radius: videoURL == nil ? CGFloat(settings.blur) : 0)
+    }
+}
+
 /// 全局背景层。有壁纸就铺满 + 模糊 + 压暗，没有就用 Theme 的暗色渐变（边上带一点强调色辉光）。
 /// 只有背景忽略安全区，内容照常参与布局。
 struct WallpaperBackground<Content: View>: View {
-    @ObservedObject private var store = WallpaperStore.shared
+    @ObservedObject private var store: WallpaperStore
 
     private let content: Content
 
-    init(@ViewBuilder content: () -> Content) {
+    init(store: WallpaperStore = WallpaperStore.shared, @ViewBuilder content: () -> Content) {
+        _store = ObservedObject(wrappedValue: store)
         self.content = content()
     }
 
@@ -147,18 +328,13 @@ struct WallpaperBackground<Content: View>: View {
 
     @ViewBuilder
     private var wallpaper: some View {
-        if store.settings.hasImage, let image = store.image {
-            GeometryReader { proxy in
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: proxy.size.width, height: proxy.size.height)
-                    // 放大一点点再裁：模糊后四边不会渗出一道浅色描边。
-                    .scaleEffect(1.06)
-                    .clipped()
-            }
-            .blur(radius: CGFloat(store.settings.blur))
-            .overlay(Color.black.opacity(store.settings.dim))
+        if store.settings.hasImage {
+            WallpaperSurface(image: store.image,
+                             videoURL: store.videoURLForPlayback,
+                             settings: store.settings)
+                // 多放大一点点再裁：模糊后四边不会渗出一道浅色描边。
+                .scaleEffect(1.04)
+                .allowsHitTesting(false)
         } else {
             ZStack {
                 Theme.bgGradient
@@ -174,12 +350,14 @@ struct WallpaperBackground<Content: View>: View {
     }
 }
 
-/// 壁纸设置页。自带 NavigationView，以 sheet 弹出；选图、调参数、清除都在这一页。
+/// 壁纸设置页。自带 NavigationView，以 sheet 弹出；选照片/视频、调画面、清除都在这一页。
 struct WallpaperPickerView: View {
     @ObservedObject var store: WallpaperStore
 
     @Environment(\.dismiss) private var dismiss
     @State private var pickedItem: PhotosPickerItem?
+    @State private var pickedVideoItem: PhotosPickerItem?
+    @State private var showVideoImporter = false
     @State private var isLoading = false
     @State private var errorText: String?
 
@@ -192,7 +370,9 @@ struct WallpaperPickerView: View {
             Form {
                 previewSection
                 imageSection
+                videoSection
                 adjustSection
+                clearSection
             }
             .scrollContentBackground(.hidden)
             .background(Theme.bgGradient.ignoresSafeArea())
@@ -209,6 +389,22 @@ struct WallpaperPickerView: View {
             .onChange(of: pickedItem) { item in
                 guard let item = item else { return }
                 load(item)
+            }
+            .onChange(of: pickedVideoItem) { item in
+                guard let item = item else { return }
+                loadVideo(item)
+            }
+            .fileImporter(isPresented: $showVideoImporter,
+                          allowedContentTypes: [.movie],
+                          allowsMultipleSelection: false) { result in
+                switch result {
+                case .success(let urls):
+                    guard let url = urls.first else { return }
+                    importVideoFile(url)
+                case .failure:
+                    // 用户取消也会走 failure，这里不当成错误弹窗。
+                    break
+                }
             }
             .alert("壁纸没设上", isPresented: Binding(
                 get: { errorText != nil },
@@ -230,17 +426,10 @@ struct WallpaperPickerView: View {
     private var previewSection: some View {
         Section {
             ZStack {
-                if let image = store.image {
-                    GeometryReader { proxy in
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: proxy.size.width, height: proxy.size.height)
-                            .scaleEffect(1.06)
-                            .clipped()
-                    }
-                    .blur(radius: CGFloat(store.settings.blur))
-                    .overlay(Color.black.opacity(store.settings.dim))
+                if store.settings.hasImage {
+                    WallpaperSurface(image: store.image,
+                                     videoURL: store.videoURLForPlayback,
+                                     settings: store.settings)
                     .overlay(alignment: .bottomLeading) {
                         Text("示例文字")
                             .font(Theme.title(15))
@@ -256,7 +445,7 @@ struct WallpaperPickerView: View {
                         .padding(.horizontal, 24)
                 }
             }
-            .frame(height: 150)
+            .frame(height: 170)
             .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous))
             .listRowInsets(EdgeInsets())
             .listRowBackground(Theme.surface)
@@ -269,7 +458,30 @@ struct WallpaperPickerView: View {
                 HStack(spacing: 10) {
                     Image(systemName: "photo.on.rectangle.angled")
                         .foregroundColor(Theme.accent)
-                    Text(store.settings.hasImage ? "换一张照片" : "从照片里选一张")
+                    Text(store.settings.hasImage && !store.settings.hasVideo ? "换一张照片" : "从照片里选一张")
+                        .foregroundColor(Theme.textPrimary)
+                    Spacer(minLength: 0)
+                    if isLoading {
+                        ProgressView()
+                    }
+                }
+            }
+            .listRowBackground(Theme.surface)
+        } header: {
+            Text("照片")
+        } footer: {
+            Text("照片和视频二选一，导入新的会覆盖旧的。壁纸只存在这台设备上，不会上传。")
+                .foregroundColor(Theme.textTertiary)
+        }
+    }
+
+    private var videoSection: some View {
+        Section {
+            PhotosPicker(selection: $pickedVideoItem, matching: .videos) {
+                HStack(spacing: 10) {
+                    Image(systemName: "video.badge.plus")
+                        .foregroundColor(Theme.accent)
+                    Text(store.settings.hasVideo ? "换一段视频" : "从照片里选视频")
                         .foregroundColor(Theme.textPrimary)
                     Spacer(minLength: 0)
                     if isLoading {
@@ -279,18 +491,29 @@ struct WallpaperPickerView: View {
             }
             .listRowBackground(Theme.surface)
 
-            if store.settings.hasImage {
-                Button(role: .destructive) {
-                    store.clear()
-                } label: {
-                    Text("清除自定义壁纸")
+            Button {
+                showVideoImporter = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder.badge.plus")
+                        .foregroundColor(Theme.accent)
+                    Text("从「文件」导入视频")
+                        .foregroundColor(Theme.textPrimary)
+                    Spacer(minLength: 0)
                 }
-                .listRowBackground(Theme.surface)
+            }
+            .listRowBackground(Theme.surface)
+
+            if store.settings.hasVideo {
+                sliderRow(title: "起点",
+                          binding: $store.settings.startSecond,
+                          range: 0...max(0.5, store.maxStartSecond),
+                          valueText: String(format: "%.1fs", store.settings.startSecond))
             }
         } header: {
-            Text("图片")
+            Text("视频")
         } footer: {
-            Text("壁纸只存在这台设备上，不会上传；工作目录里的文件不受影响。")
+            Text("视频静音、循环、铺满裁切；切到后台自动暂停，回来继续。起点决定每次循环从哪里开始。")
                 .foregroundColor(Theme.textTertiary)
         }
     }
@@ -305,10 +528,44 @@ struct WallpaperPickerView: View {
                       binding: $store.settings.dim,
                       range: 0...0.8,
                       valueText: "\(Int((store.settings.dim * 100).rounded()))%")
+            sliderRow(title: "放大",
+                      binding: $store.settings.scale,
+                      range: 1...3,
+                      valueText: String(format: "%.1f×", store.settings.scale))
+            sliderRow(title: "横向",
+                      binding: $store.settings.offsetX,
+                      range: -1...1,
+                      valueText: percentText(store.settings.offsetX))
+            sliderRow(title: "纵向",
+                      binding: $store.settings.offsetY,
+                      range: -1...1,
+                      valueText: percentText(store.settings.offsetY))
         } header: {
-            Text("显示")
+            Text("画面")
         } footer: {
-            Text("模糊和暗化都是为了让壁纸上的正文读得清；拉到 0 就是原图。")
+            Text("模糊和暗化是为了让壁纸上的正文读得清；放大和位移用来挑画面里露出来的部分，预览实时跟着变。")
+                .foregroundColor(Theme.textTertiary)
+        }
+    }
+
+    private var clearSection: some View {
+        Section {
+            if store.settings.hasImage {
+                Button(role: .destructive) {
+                    store.clear()
+                } label: {
+                    Text("清除自定义壁纸")
+                }
+                .listRowBackground(Theme.surface)
+            } else {
+                Text("当前没有自定义壁纸。")
+                    .foregroundColor(Theme.textTertiary)
+                    .listRowBackground(Theme.surface)
+            }
+        } header: {
+            Text("重置")
+        } footer: {
+            Text("清除只删壁纸文件和画面参数；工作目录里的文件不受影响。")
                 .foregroundColor(Theme.textTertiary)
         }
     }
@@ -324,12 +581,16 @@ struct WallpaperPickerView: View {
             Text(valueText)
                 .font(Theme.monoSmall)
                 .foregroundColor(Theme.textSecondary)
-                .frame(width: 44, alignment: .trailing)
+                .frame(width: 52, alignment: .trailing)
         }
         .listRowBackground(Theme.surface)
     }
 
-    // MARK: - 选图
+    private func percentText(_ value: Double) -> String {
+        return String(format: "%+.0f%%", value * 100)
+    }
+
+    // MARK: - 选照片 / 选视频
 
     private func load(_ item: PhotosPickerItem) {
         isLoading = true
@@ -346,6 +607,34 @@ struct WallpaperPickerView: View {
             } catch {
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
+        }
+    }
+
+    private func loadVideo(_ item: PhotosPickerItem) {
+        isLoading = true
+        Task { @MainActor in
+            defer {
+                isLoading = false
+                pickedVideoItem = nil
+            }
+            do {
+                guard let movie = try await item.loadTransferable(type: WallpaperMovie.self) else {
+                    throw WallpaperError.message("读不到这段视频，换一段试试（相册里的 mov / mp4 都可以）。")
+                }
+                try store.importVideo(from: movie.url)
+            } catch {
+                errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        }
+    }
+
+    private func importVideoFile(_ url: URL) {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            try store.importVideo(from: url)
+        } catch {
+            errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 }
