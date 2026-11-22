@@ -217,6 +217,12 @@ enum Tools {
                  "value": ("string", "set 时的新值，统一按字符串传（布尔用 true/false）。")],
                 required: []
             ),
+            spec(
+                "open_settings",
+                "尝试打开系统设置（比如应用存储、通知、隐私页），用于「用户要去做一件 App 里做不到的事」时把用户带到能做的地方。返回是否跳成功和该说的话。",
+                ["section": ("string", "可选，想去的设置分区名，例如 General、STORAGE、PRIVACY、NOTIFICATIONS；留空就打开设置首页。")],
+                required: []
+            ),
         ]
     }
 
@@ -253,7 +259,8 @@ enum Tools {
             case "now":        return nowString()
             case "open_url":   return try await openURL(args)
             case "app_config": return try appConfig(args)
-            default:           return "错误：没有名为 \(name) 的工具。可用工具：list_dir, read_file, write_file, edit_file, make_dir, delete_path, move_path, copy_path, search_files, file_info, fetch_url, run_js, now, open_url, app_config"
+            case "open_settings": return try await openSettings(args)
+            default:           return "错误：没有名为 \(name) 的工具。可用工具：list_dir, read_file, write_file, edit_file, make_dir, delete_path, move_path, copy_path, search_files, file_info, fetch_url, run_js, now, open_url, app_config, open_settings"
             }
         } catch {
             let text = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -288,6 +295,34 @@ enum Tools {
         }
         if opened { return "已经用系统打开 \(normalized)" }
         throw ToolFailure.message("系统打不开 \(normalized) —— 可能这台设备没装对应的 App，或者 scheme 不对。")
+    }
+
+    /// 打开系统设置。iOS 没有公开的「深链到某个设置页」API，App-Prefs: 属于能用但未文档化的 scheme；
+    /// 打不开就如实返回，让模型带着用户手动点。这里绝不假装成功。
+    private static func openSettings(_ args: [String: Any]) async throws -> String {
+        let raw = (try? string(args, "section", fallback: "")) ?? ""
+        let section = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var candidates: [String] = []
+        if !section.isEmpty {
+            candidates.append("App-Prefs:root=\(section)")
+            candidates.append("App-Prefs:\(section)")
+        }
+        candidates.append("App-Prefs:root=SETTINGS")
+        candidates.append("app-settings:")
+
+        for rawURL in candidates {
+            guard let url = URL(string: rawURL) else { continue }
+            let opened: Bool = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                DispatchQueue.main.async {
+                    UIApplication.shared.open(url, options: [:]) { ok in cont.resume(returning: ok) }
+                }
+            }
+            if opened {
+                let target = section.isEmpty ? "系统设置首页" : "系统设置的 \(section)"
+                return "已打开\(target)。现在把接下来几步告诉用户：按 App 里的实际路径写清楚点哪里（例如「设置 → 通用 → iPad 储存空间 → 找到 DSH → 删除 App」），别只说「你去设置里弄」。"
+            }
+        }
+        return "系统不允许 App 直接跳到设置（深链被拒）。请直接给用户手动路径：打开「设置」App，然后按条目一步步走。"
     }
 
     private static func appConfig(_ args: [String: Any]) throws -> String {

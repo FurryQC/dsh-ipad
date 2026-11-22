@@ -24,6 +24,8 @@ struct WallpaperSettings: Codable, Equatable {
     var offsetY: Double = 0
     /// 视频循环起点（秒）。导入后按实际时长夹到 0...10。
     var startSecond: Double = 0
+    /// 壁纸是不是网页。为 true 时用 WebView 跑 Documents/wallpaper.html，照片和视频都不生效。
+    var hasHTML: Bool = false
 
     init() {}
 
@@ -36,6 +38,7 @@ struct WallpaperSettings: Codable, Equatable {
         case offsetX
         case offsetY
         case startSecond
+        case hasHTML
     }
 
     /// 旧版本只存了 blur / dim / hasImage。缺的字段补默认值，升级后壁纸不能凭空消失。
@@ -49,6 +52,7 @@ struct WallpaperSettings: Codable, Equatable {
         offsetX = try container.decodeIfPresent(Double.self, forKey: .offsetX) ?? 0
         offsetY = try container.decodeIfPresent(Double.self, forKey: .offsetY) ?? 0
         startSecond = try container.decodeIfPresent(Double.self, forKey: .startSecond) ?? 0
+        hasHTML = try container.decodeIfPresent(Bool.self, forKey: .hasHTML) ?? false
     }
 }
 
@@ -99,6 +103,21 @@ final class WallpaperStore: ObservableObject {
         guard settings.hasVideo else { return nil }
         return FileManager.default.fileExists(atPath: videoURL.path) ? videoURL : nil
     }
+
+    /// 网页壁纸固定文件名。同目录的图片/字体能相对引用（allowingReadAccessTo 给了整个 Documents）。
+    var htmlURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("wallpaper.html")
+    }
+
+    /// 网页壁纸要加载的地址。标记为网页但文件没了就返回 nil。
+    var htmlURLForDisplay: URL? {
+        guard settings.hasHTML else { return nil }
+        return FileManager.default.fileExists(atPath: htmlURL.path) ? htmlURL : nil
+    }
+
+    /// 换了一个 html 文件后 WebView 得重新加载：路径不变，靠这个计数触发刷新。
+    @Published private(set) var htmlReloadToken = 0
 
     /// 起点滑杆的上限：最多 10 秒，也绝不越过结尾。
     var maxStartSecond: Double {
@@ -193,14 +212,47 @@ final class WallpaperStore: ObservableObject {
         refreshVideoDuration()
     }
 
-    /// 清除壁纸：删照片和视频、关标记、画面参数回到原始状态。文件本来就不在也当成功。
-    func clear() {
+    /// 导入网页壁纸：拷成 Documents/wallpaper.html，照片和视频一并清掉。
+    func importHTML(from source: URL) throws {
+        let ext = source.pathExtension.lowercased()
+        guard ext == "html" || ext == "htm" else {
+            throw WallpaperError.message("只支持 .html / .htm 文件。想做动画壁纸，把 HTML 和它的图片、CSS 放同一个文件夹里再一起导入（现在只取这一个文件）。")
+        }
+
+        let scoped = source.startAccessingSecurityScopedResource()
+        defer {
+            if scoped {
+                source.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        do {
+            let data = try Data(contentsOf: source)
+            try data.write(to: htmlURL, options: .atomic)
+        } catch {
+            throw WallpaperError.message("这个 html 拷不进沙盒：\(error.localizedDescription)")
+        }
+
         try? FileManager.default.removeItem(at: imageURL)
         try? FileManager.default.removeItem(at: videoURL)
         image = nil
         videoDuration = 0
+        settings.hasVideo = false
+        settings.hasHTML = true
+        settings.hasImage = true
+        htmlReloadToken += 1
+    }
+
+    /// 清除壁纸：删照片和视频、关标记、画面参数回到原始状态。文件本来就不在也当成功。
+    func clear() {
+        try? FileManager.default.removeItem(at: imageURL)
+        try? FileManager.default.removeItem(at: videoURL)
+        try? FileManager.default.removeItem(at: htmlURL)
+        image = nil
+        videoDuration = 0
         settings.hasImage = false
         settings.hasVideo = false
+        settings.hasHTML = false
         settings.scale = 1
         settings.offsetX = 0
         settings.offsetY = 0
@@ -328,7 +380,24 @@ struct WallpaperBackground<Content: View>: View {
 
     @ViewBuilder
     private var wallpaper: some View {
-        if store.settings.hasImage {
+        if store.settings.hasHTML {
+            ZStack {
+                // WebView 是透明底的，垫一层黑：网页自己没铺满时不会漏出系统背景。
+                Color.black
+                if let url = store.htmlURLForDisplay {
+                    HTMLWallpaperView(fileURL: url, reloadToken: store.htmlReloadToken)
+                }
+                // WKWebView 的内容也吃不到 SwiftUI 的 blur，用毛玻璃层近似。
+                if store.settings.blur > 0.5 {
+                    VideoBlurVeil(intensity: store.settings.blur / 24)
+                        .allowsHitTesting(false)
+                }
+                Color.black
+                    .opacity(store.settings.dim)
+                    .allowsHitTesting(false)
+            }
+            .allowsHitTesting(false)
+        } else if store.settings.hasImage {
             WallpaperSurface(image: store.image,
                              videoURL: store.videoURLForPlayback,
                              settings: store.settings)
@@ -358,6 +427,7 @@ struct WallpaperPickerView: View {
     @State private var pickedItem: PhotosPickerItem?
     @State private var pickedVideoItem: PhotosPickerItem?
     @State private var showVideoImporter = false
+    @State private var showHTMLImporter = false
     @State private var isLoading = false
     @State private var errorText: String?
 
@@ -371,6 +441,7 @@ struct WallpaperPickerView: View {
                 previewSection
                 imageSection
                 videoSection
+                htmlSection
                 adjustSection
                 clearSection
             }
@@ -405,6 +476,18 @@ struct WallpaperPickerView: View {
                     // 用户取消也会走 failure，这里不当成错误弹窗。
                     break
                 }
+            }
+            .sheet(isPresented: $showHTMLImporter) {
+                DocumentPicker(mode: .files) { urls in
+                    showHTMLImporter = false
+                    guard let url = urls.first else { return }
+                    do {
+                        try store.importHTML(from: url)
+                    } catch {
+                        errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    }
+                }
+                .ignoresSafeArea()
             }
             .alert("壁纸没设上", isPresented: Binding(
                 get: { errorText != nil },
@@ -449,6 +532,38 @@ struct WallpaperPickerView: View {
             .clipShape(RoundedRectangle(cornerRadius: Theme.radiusSmall, style: .continuous))
             .listRowInsets(EdgeInsets())
             .listRowBackground(Theme.surface)
+        }
+    }
+
+    private var htmlSection: some View {
+        Section {
+            Button {
+                showHTMLImporter = true
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "chevron.left.forwardslash.chevron.right")
+                        .foregroundColor(Theme.accent)
+                    Text(store.settings.hasHTML ? "换一个网页壁纸" : "导入网页壁纸（.html）")
+                        .foregroundColor(Theme.textPrimary)
+                    Spacer(minLength: 0)
+                    if isLoading {
+                        ProgressView()
+                    }
+                }
+            }
+            .listRowBackground(Theme.surface)
+
+            if store.settings.hasHTML {
+                Text("当前是网页壁纸。网页里的动画会一直跑，比较费电；卡就把模糊拉高一点，它会盖一层毛玻璃。")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.textTertiary)
+                    .listRowBackground(Theme.surface)
+            }
+        } header: {
+            Text("网页壁纸")
+        } footer: {
+            Text("选一个 .html 文件，它会在壁纸层里真跑（CSS 动画、canvas 都可以）。目前只取 html 这一个文件：引用了图片或字体的话，请写绝对 URL，或者把资源一起放进 App 的 Documents 目录。")
+                .foregroundColor(Theme.textTertiary)
         }
     }
 
