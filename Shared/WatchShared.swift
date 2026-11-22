@@ -12,6 +12,9 @@ enum WatchShared {
     static let lastResultAtKey = "watch.lastResultAt"
     static let extensionBundleID = "com.dsh.qc.broadcast"
 
+    /// 主 App 把配置挂在 loopback 上给扩展取用，绕开 App Group entitlement。
+    static let loopbackPort: UInt16 = 56290
+
     static var defaults: UserDefaults { UserDefaults(suiteName: suiteName) ?? .standard }
 
     struct Config: Codable {
