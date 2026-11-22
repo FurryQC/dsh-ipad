@@ -1,23 +1,35 @@
 import Foundation
-import SwiftUI
 import UIKit
 
-/// App 的全部状态：会话、模型请求、工具循环、持久化、切后台提醒。
+/// 可选模型。
+struct ModelOption: Identifiable, Hashable {
+    var id: String
+    var name: String
+}
+
+/// 会话与运行的唯一状态源。
+///
+/// 传输走 Messages API（见 `MessagesAPI`），工具在本机执行，所有会话历史落在
+/// `Documents/sessions.json`，工作目录是 `Documents/workspace`。
 @MainActor
 final class AppModel: ObservableObject {
-
-    // MARK: - 持久化状态
+    // MARK: - 会话
 
     @Published var sessions: [ChatSession] = []
     @Published var currentSessionID: UUID
 
-    // MARK: - 设置（UserDefaults / Keychain）
+    // MARK: - 设置
 
+    /// 接口地址。默认就是 DSH 桌面版用的 Messages 端点根。
     @Published var baseURL: String {
         didSet { UserDefaults.standard.set(baseURL, forKey: Keys.baseURL) }
     }
     @Published var model: String {
         didSet { UserDefaults.standard.set(model, forKey: Keys.model) }
+    }
+    /// 推理等级：off / low / high / max，与 DSH 的 reasoningEffort 同名同义。
+    @Published var reasoningEffort: String {
+        didSet { UserDefaults.standard.set(reasoningEffort, forKey: Keys.effort) }
     }
     @Published var maxRounds: Int {
         didSet { UserDefaults.standard.set(maxRounds, forKey: Keys.maxRounds) }
@@ -25,61 +37,64 @@ final class AppModel: ObservableObject {
     @Published var warnBeforeRun: Bool {
         didSet { UserDefaults.standard.set(warnBeforeRun, forKey: Keys.warnBeforeRun) }
     }
-    /// 只在设置页点「保存」时写钥匙串。每敲一个字符写一次会在主线程上同步写 Keychain，输入会卡。
+    /// 只在设置页点「保存」时写钥匙串，输入过程中不落盘。
     @Published var apiKey: String
 
     // MARK: - 运行状态
 
     @Published var isRunning = false
     @Published var streamPreview = ""
+    @Published var reasoningPreview = ""
     @Published var statusLine = ""
     @Published var errorText: String?
     @Published var showSwitchWarning = false
+    @Published var availableModels: [ModelOption] = []
+    @Published var isFetchingModels = false
 
     private var pendingPrompt: String?
     private var runTask: Task<Void, Never>?
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var backgroundedDuringRun = false
-    /// 本次启动是否已经提示过「别切走」。只放内存，重启 App 后重新提醒一次。
+    /// 只放内存：重启 App 后重新提醒一次。
     private var warnedThisLaunch = false
-    /// 当前这次运行的标识。被 stop 掉的旧任务收尾时不能改动新任务的状态。
+    /// 被 stop 的旧任务收尾时不能改动新任务的状态。
     private var runID = UUID()
 
     private enum Keys {
         static let baseURL = "dsh.baseURL"
         static let model = "dsh.model"
+        static let effort = "dsh.effort"
         static let maxRounds = "dsh.maxRounds"
         static let warnBeforeRun = "dsh.warnBeforeRun"
     }
 
-    // MARK: - 初始化
+    // MARK: - 生命周期
 
     init() {
         let defaults = UserDefaults.standard
-        baseURL = defaults.string(forKey: Keys.baseURL) ?? "https://api.deepseek.com"
-        model = defaults.string(forKey: Keys.model) ?? "deepseek-chat"
+        baseURL = defaults.string(forKey: Keys.baseURL) ?? "https://api.deepseek.com/anthropic"
+        model = defaults.string(forKey: Keys.model) ?? "deepseek-flash"
+        reasoningEffort = defaults.string(forKey: Keys.effort) ?? "high"
         let rounds = defaults.integer(forKey: Keys.maxRounds)
         maxRounds = rounds > 0 ? rounds : 24
         warnBeforeRun = defaults.object(forKey: Keys.warnBeforeRun) as? Bool ?? true
         apiKey = Keychain.loadAPIKey()
-        currentSessionID = UUID()
-
+        let first = ChatSession()
+        sessions = [first]
+        currentSessionID = first.id
         Workspace.prepare()
+        PluginHost.shared.reload()
         loadSessions()
     }
 
-    // MARK: - 会话
+    // MARK: - 会话操作
 
-    var currentSession: ChatSession {
-        sessions.first(where: { $0.id == currentSessionID }) ?? ChatSession()
+    var currentSession: ChatSession? {
+        sessions.first { $0.id == currentSessionID }
     }
 
     var currentItems: [ChatItem] {
-        currentSession.items
-    }
-
-    func sessionItems(_ id: UUID) -> [ChatItem] {
-        sessions.first(where: { $0.id == id })?.items ?? []
+        currentSession?.items ?? []
     }
 
     func newSession() {
@@ -91,41 +106,45 @@ final class AppModel: ObservableObject {
     }
 
     func select(_ id: UUID) {
-        guard !isRunning, sessions.contains(where: { $0.id == id }) else { return }
+        guard !isRunning else { return }
         currentSessionID = id
     }
 
     func deleteSession(_ id: UUID) {
-        guard !isRunning else { return }
+        guard !isRunning, sessions.count > 1 else { return }
         sessions.removeAll { $0.id == id }
-        if sessions.isEmpty { sessions = [ChatSession()] }
-        if !sessions.contains(where: { $0.id == currentSessionID }) {
-            currentSessionID = sessions[0].id
+        if currentSessionID == id, let first = sessions.first {
+            currentSessionID = first.id
         }
         save()
     }
 
     func clearCurrent() {
         guard !isRunning else { return }
-        mutate(currentSessionID) { $0.items.removeAll() }
+        mutate(currentSessionID) { $0.items = [] }
     }
 
-    // MARK: - 发送
+    // MARK: - 发送与任务循环
 
-    func send(_ text: String) {
-        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty, !isRunning else { return }
-        guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            errorText = "还没填 API key。右上角齿轮 → 填 DeepSeek API key。"
+    func send(_ prompt: String) {
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isRunning else { return }
+        var problem: String?
+        if apiKey.trimmingCharacters(in: .whitespaces).isEmpty {
+            problem = "还没填 API key。到设置里填一个，保存后再发。"
+        } else if MessagesAPI.endpoint(base: baseURL) == nil {
+            problem = "接口地址不可用：\(baseURL)"
+        }
+        if let problem {
+            errorText = problem
             return
         }
-
         if warnBeforeRun && !warnedThisLaunch {
-            pendingPrompt = prompt
+            pendingPrompt = text
             showSwitchWarning = true
             return
         }
-        startRun(prompt: prompt)
+        startRun(prompt: text, appendUserMessage: true)
     }
 
     func confirmSwitchWarning() {
@@ -133,7 +152,7 @@ final class AppModel: ObservableObject {
         warnedThisLaunch = true
         guard let prompt = pendingPrompt else { return }
         pendingPrompt = nil
-        startRun(prompt: prompt)
+        startRun(prompt: prompt, appendUserMessage: true)
     }
 
     func cancelSwitchWarning() {
@@ -147,57 +166,52 @@ final class AppModel: ObservableObject {
         isRunning = false
         statusLine = ""
         streamPreview = ""
+        reasoningPreview = ""
         endBackgroundGrace()
     }
 
     func retry() {
         guard !isRunning else { return }
-        let items = currentItems
-        guard let lastUser = items.last(where: { $0.role == .user }) else { return }
-        startRun(prompt: lastUser.text, appendUserMessage: false)
+        let lastUser = currentItems.last { $0.role == .user }
+        guard let prompt = lastUser?.text else { return }
+        mutate(currentSessionID) { session in
+            while let last = session.items.last, last.role != .user {
+                session.items.removeLast()
+            }
+            if let last = session.items.last, last.role == .user {
+                session.items.removeLast()
+            }
+        }
+        startRun(prompt: prompt, appendUserMessage: true)
     }
 
-    // MARK: - 场景变化（切前台/后台）
-
-    func handleScenePhase(_ phase: ScenePhase) {
+    func handleScenePhase(_ phase: ScenePhaseValue) {
         switch phase {
-        case .background:
-            if isRunning {
-                backgroundedDuringRun = true
-                statusLine = "App 已在后台。iOS 只给几十秒，超时任务会被挂起。"
-            }
         case .active:
-            if isRunning {
-                statusLine = "正在运行，请留在本 App。"
+            if backgroundedDuringRun && isRunning {
+                statusLine = "App 刚从后台回来，这一轮可能已经断了。"
             }
-        default:
-            break
+            backgroundedDuringRun = false
+        case .background, .inactive:
+            if isRunning { backgroundedDuringRun = true }
         }
     }
 
-    // MARK: - 主循环
-
-    private func startRun(prompt: String, appendUserMessage: Bool = true) {
+    private func startRun(prompt: String, appendUserMessage: Bool) {
         let sessionID = currentSessionID
-        errorText = nil
-        streamPreview = ""
-        statusLine = "准备中…"
-        isRunning = true
-
-        mutate(sessionID) { session in
-            if appendUserMessage {
-                session.items.append(ChatItem(role: .user, text: prompt))
-            }
-            if session.title == "新会话", let first = session.items.first(where: { $0.role == .user }) {
-                session.title = String(first.text.prefix(20))
-            }
+        if appendUserMessage {
+            appendItem(ChatItem(role: .user, text: prompt), to: sessionID)
         }
-
+        errorText = nil
+        isRunning = true
+        statusLine = "正在思考…"
+        streamPreview = ""
+        reasoningPreview = ""
         beginBackgroundGrace()
         let id = UUID()
         runID = id
         runTask = Task { [weak self] in
-            guard let self = self else { return }
+            guard let self else { return }
             await self.runLoop(sessionID: sessionID, runID: id)
         }
     }
@@ -205,71 +219,71 @@ final class AppModel: ObservableObject {
     private func runLoop(sessionID: UUID, runID myID: UUID) async {
         var round = 0
         var finishedNaturally = false
-        while isRunning && runID == myID && round < maxRounds {
+
+        while isRunning, runID == myID, round < maxRounds {
             round += 1
-            statusLine = "第 \(round) 轮 · 模型思考中…"
+            statusLine = "第 \(round) 轮：正在思考…"
+            streamPreview = ""
+            reasoningPreview = ""
+
+            let turn: MessagesAPI.Turn
             do {
-                let turn = try await performChat(sessionID: sessionID)
-                streamPreview = ""
-
-                let hasText = !turn.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                if hasText || !turn.toolCalls.isEmpty {
-                    mutate(sessionID) { session in
-                        session.items.append(ChatItem(role: .assistant,
-                                                      text: turn.text,
-                                                      toolCalls: turn.toolCalls))
-                    }
-                }
-
-                if turn.toolCalls.isEmpty {
-                    if !hasText {
-                        mutate(sessionID) { session in
-                            session.items.append(ChatItem(role: .assistant, text: "（模型这轮没有返回内容）"))
-                        }
-                    }
-                    finishedNaturally = true
-                    break
-                }
-
-                var returned: Set<String> = []
-                for call in turn.toolCalls {
-                    if !isRunning || runID != myID { break }
-                    statusLine = "执行工具 \(call.name)…"
-                    let result = await Tools.execute(name: call.name, arguments: call.arguments)
-                    returned.insert(call.id)
-                    let failed = result.hasPrefix("错误：")
-                    mutate(sessionID) { session in
-                        session.items.append(ChatItem(role: .tool,
-                                                      text: result,
-                                                      toolCallId: call.id,
-                                                      toolName: call.name,
-                                                      isError: failed))
-                    }
-                }
-
-                // 被停止时剩余的 tool_call 也要补一条结果，否则下一次请求会因
-                // tool_calls 和 tool 消息不对应被 DeepSeek 拒绝，这个会话就废了。
-                if !isRunning || runID != myID {
-                    let missing = turn.toolCalls.filter { !returned.contains($0.id) }
-                    for call in missing {
-                        mutate(sessionID) { session in
-                            session.items.append(ChatItem(role: .tool,
-                                                          text: "错误：用户已停止任务，这个工具没有执行。",
-                                                          toolCallId: call.id,
-                                                          toolName: call.name,
-                                                          isError: true))
-                        }
-                    }
-                    break
-                }
+                turn = try await performChat(sessionID: sessionID)
             } catch is CancellationError {
                 break
             } catch {
-                let message = describe(error)
-                if !message.isEmpty {
-                    errorText = message
-                    mutate(sessionID) { session in
-                        session.items.append(ChatItem(role: .assistant, text: message, isError: true))
+                guard runID == myID else { return }
+                appendItem(ChatItem(role: .assistant, text: describe(error), isError: true), to: sessionID)
+                break
+            }
+
+            let assistantItem = ChatItem(
+                role: .assistant,
+                text: turn.text,
+                toolCalls: turn.toolCalls,
+                reasoning: turn.reasoning.isEmpty ? nil : turn.reasoning,
+                reasoningSignature: turn.signature.isEmpty ? nil : turn.signature
+            )
+            appendItem(assistantItem, to: sessionID)
+            streamPreview = ""
+
+            if turn.toolCalls.isEmpty {
+                finishedNaturally = true
+                break
+            }
+
+            var returned: Set<String> = []
+            for call in turn.toolCalls {
+                if !isRunning || runID != myID { break }
+                statusLine = "正在执行 \(call.name)…"
+                let output = await executeTool(name: call.name, arguments: call.arguments)
+                appendItem(
+                    ChatItem(
+                        role: .tool,
+                        text: output,
+                        toolCallId: call.id,
+                        toolName: call.name,
+                        isError: output.hasPrefix("错误：")
+                    ),
+                    to: sessionID
+                )
+                returned.insert(call.id)
+            }
+
+            if !isRunning || runID != myID {
+                let missing = turn.toolCalls.filter { !returned.contains($0.id) }
+                if !missing.isEmpty {
+                    for call in missing {
+                        appendItem(
+                            ChatItem(
+                                role: .tool,
+                                text: "错误：用户已停止任务，这个工具没有执行。",
+                                toolCallId: call.id,
+                                toolName: call.name,
+                                isError: true
+                            ),
+                            to: sessionID
+                        )
                     }
                 }
                 break
@@ -277,15 +291,19 @@ final class AppModel: ObservableObject {
         }
 
         if !finishedNaturally && round >= maxRounds && isRunning && runID == myID {
-            let note = "已经跑了 \(maxRounds) 轮工具，先停在这里。要继续的话再发一条消息。"
-            mutate(sessionID) { session in
-                session.items.append(ChatItem(role: .assistant, text: note))
-            }
+            appendItem(
+                ChatItem(
+                    role: .assistant,
+                    text: "已经跑了 \(maxRounds) 轮工具，先停在这里。要接着做就再发一句话。",
+                    isError: true
+                ),
+                to: sessionID
+            )
         }
 
-        // 被 stop 之后又开了新任务时，旧任务不能把新任务的状态清掉。
         guard runID == myID else { return }
         streamPreview = ""
+        reasoningPreview = ""
         statusLine = ""
         isRunning = false
         runTask = nil
@@ -293,172 +311,245 @@ final class AppModel: ObservableObject {
         save()
     }
 
-    // MARK: - 模型请求（SSE 流式）
+    // MARK: - 网络
 
-    private func performChat(sessionID: UUID) async throws -> AssistantTurn {
-        let body = ChatRequest(model: model,
-                               messages: wireMessages(sessionID: sessionID),
-                               tools: Tools.specs,
-                               tool_choice: "auto",
-                               stream: true)
-
-        var request = URLRequest(url: try endpointURL())
-        request.httpMethod = "POST"
-        request.timeoutInterval = 300
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer " + apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
-                         forHTTPHeaderField: "Authorization")
-        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        request.httpBody = try JSONEncoder().encode(body)
-
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            var raw = Data()
-            for try await byte in bytes { raw.append(byte) }
-            let text = String(data: raw, encoding: .utf8) ?? ""
-            throw ToolFailure.message("DeepSeek 返回 HTTP \(http.statusCode)：\n" + Tools.clip(text))
+    private func performChat(sessionID: UUID) async throws -> MessagesAPI.Turn {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            throw MessagesAPI.Failure(message: "没有 API key。")
         }
-
-        var text = ""
-        var builders: [Int: (id: String, name: String, args: String)] = [:]
-
-        for try await line in bytes.lines {
-            if Task.isCancelled { throw CancellationError() }
-            guard line.hasPrefix("data:") else { continue }
-            let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            if payload.isEmpty { continue }
-            if payload == "[DONE]" { break }
-            guard let data = payload.data(using: .utf8),
-                  let chunk = try? JSONDecoder().decode(StreamChunk.self, from: data),
-                  let choice = chunk.choices?.first,
-                  let delta = choice.delta
-            else { continue }
-
-            if let piece = delta.content, !piece.isEmpty {
-                text += piece
-                streamPreview = text
+        guard let url = MessagesAPI.endpoint(base: baseURL) else {
+            throw MessagesAPI.Failure(message: "接口地址不合法：\(baseURL)")
+        }
+        let options = MessagesAPI.RequestOptions(
+            model: model,
+            system: systemPrompt(),
+            effort: reasoningEffort,
+            maxTokens: 8192,
+            messages: wireMessages(sessionID: sessionID),
+            tools: wireTools()
+        )
+        guard let payload = MessagesAPI.body(options) else {
+            throw MessagesAPI.Failure(message: "请求体无法编码成 JSON。")
+        }
+        let request = MessagesAPI.request(url: url, apiKey: key, body: payload)
+        return try await MessagesAPI.stream(
+            request: request,
+            onText: { delta in
+                Task { @MainActor [weak self] in self?.streamPreview += delta }
+            },
+            onReasoning: { delta in
+                Task { @MainActor [weak self] in self?.reasoningPreview += delta }
             }
-
-            if let calls = delta.tool_calls {
-                for call in calls {
-                    let index = call.index ?? builders.count
-                    var builder = builders[index] ?? (id: "", name: "", args: "")
-                    if let id = call.id, !id.isEmpty { builder.id = id }
-                    if let function = call.function {
-                        if let name = function.name, !name.isEmpty { builder.name = name }
-                        if let arguments = function.arguments { builder.args += arguments }
-                    }
-                    builders[index] = builder
-                }
-            }
-        }
-
-        let toolCalls: [ToolCall] = builders.keys.sorted().compactMap { key in
-            guard let builder = builders[key], !builder.name.isEmpty else { return nil }
-            return ToolCall(id: builder.id.isEmpty ? UUID().uuidString : builder.id,
-                            name: builder.name,
-                            arguments: builder.args.isEmpty ? "{}" : builder.args)
-        }
-
-        return AssistantTurn(text: text, toolCalls: toolCalls)
+        )
     }
 
-    private func endpointURL() throws -> URL {
-        var base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if base.isEmpty { base = "https://api.deepseek.com" }
-        if !(base.lowercased().hasPrefix("http://") || base.lowercased().hasPrefix("https://")) {
-            base = "https://" + base
+    /// 从 `/models` 拉模型列表；失败只提示，不改当前选择。
+    func fetchModels() async {
+        guard let url = MessagesAPI.modelsURL(base: baseURL) else {
+            errorText = "接口地址不合法，没法拉模型列表。"
+            return
         }
-        while base.hasSuffix("/") { base.removeLast() }
-        if !base.hasSuffix("/chat/completions") { base += "/chat/completions" }
-        guard let url = URL(string: base) else {
-            throw ToolFailure.message("接口地址不合法：\(base)")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "accept")
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty {
+            request.setValue(key, forHTTPHeaderField: "x-api-key")
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "authorization")
         }
-        return url
+        isFetchingModels = true
+        defer { isFetchingModels = false }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else {
+                throw MessagesAPI.Failure(message: "拉模型列表失败：HTTP \(code)")
+            }
+            availableModels = Self.parseModels(data)
+            if availableModels.isEmpty {
+                throw MessagesAPI.Failure(message: "接口没返回任何模型。")
+            }
+            if !availableModels.contains(where: { $0.id == model }), let first = availableModels.first {
+                model = first.id
+            }
+        } catch {
+            errorText = describe(error)
+        }
     }
 
-    private func wireMessages(sessionID: UUID) -> [WireMessage] {
-        var out: [WireMessage] = [WireMessage(role: "system", content: systemPrompt())]
-        let items = sessions.first(where: { $0.id == sessionID })?.items ?? []
+    static func parseModels(_ data: Data) -> [ModelOption] {
+        let object = (try? JSONSerialization.jsonObject(with: data, options: []))
+        var entries: [[String: Any]] = []
+        if let root = object as? [String: Any] {
+            entries = (root["data"] as? [[String: Any]]) ?? (root["models"] as? [[String: Any]]) ?? []
+        } else if let root = object as? [[String: Any]] {
+            entries = root
+        }
+        var options: [ModelOption] = []
+        for entry in entries {
+            guard let id = entry["id"] as? String ?? entry["name"] as? String, !id.isEmpty else { continue }
+            let name = (entry["display_name"] as? String) ?? (entry["name"] as? String) ?? id
+            options.append(ModelOption(id: id, name: name))
+        }
+        return options
+    }
+
+    // MARK: - 请求组装
+
+    /// 插件工具优先：插件注册的名字与内置工具重名时插件会被改名，所以不会撞。
+    private func executeTool(name: String, arguments: String) async -> String {
+        if PluginHost.shared.hasTool(name) {
+            do {
+                return try await PluginHost.shared.call(name: name, arguments: arguments)
+            } catch {
+                let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                return "错误：\(text)"
+            }
+        }
+        return await Tools.execute(name: name, arguments: arguments)
+    }
+
+    private func wireTools() -> [[String: Any]] {
+        (Tools.specs + PluginHost.shared.toolSpecs()).map { spec in
+            var properties: [String: Any] = [:]
+            for (key, value) in spec.function.parameters.properties {
+                properties[key] = ["type": value.type, "description": value.description]
+            }
+            let schema: [String: Any] = [
+                "type": "object",
+                "properties": properties,
+                "required": spec.function.parameters.required,
+            ]
+            return [
+                "name": spec.function.name,
+                "description": spec.function.description,
+                "input_schema": schema,
+            ]
+        }
+    }
+
+    /// 会话历史 → Messages API 的 messages 数组。
+    ///
+    /// 三条硬约定：tool_result 必须放在 user 消息里且紧跟对应 tool_use；
+    /// 连续同角色消息合并；thinking 只在带签名时回放（没有签名服务端会拒），
+    /// 推理关闭时不回放任何 thinking 块。
+    private func wireMessages(sessionID: UUID) -> [[String: Any]] {
+        let items = sessions.first { $0.id == sessionID }?.items ?? []
+        var messages: [[String: Any]] = []
+        var pendingResults: [[String: Any]] = []
+
+        func flushResults() {
+            guard !pendingResults.isEmpty else { return }
+            messages.append(["role": "user", "content": pendingResults])
+            pendingResults = []
+        }
+
+        func appendText(role: String, text: String) {
+            guard !text.isEmpty else { return }
+            let block: [String: Any] = ["type": "text", "text": text]
+            if var last = messages.last, (last["role"] as? String) == role,
+               let existing = last["content"] as? [[String: Any]],
+               existing.allSatisfy({ ($0["type"] as? String) == "text" }) {
+                var blocks = existing
+                blocks.append(block)
+                last["content"] = blocks
+                messages[messages.count - 1] = last
+            } else {
+                messages.append(["role": role, "content": [block]])
+            }
+        }
+
         for item in items {
             switch item.role {
             case .user:
-                out.append(WireMessage(role: "user", content: item.text))
+                flushResults()
+                appendText(role: "user", text: item.text)
             case .assistant:
-                let calls = item.toolCalls.map { call in
-                    WireToolCall(id: call.id,
-                                 type: "function",
-                                 function: WireFunction(name: call.name, arguments: call.arguments))
+                flushResults()
+                var blocks: [[String: Any]] = []
+                if reasoningEffort != "off", let reasoning = item.reasoning, let signature = item.reasoningSignature, !signature.isEmpty {
+                    blocks.append(["type": "thinking", "thinking": reasoning, "signature": signature])
                 }
-                out.append(WireMessage(role: "assistant",
-                                       content: item.text.isEmpty ? nil : item.text,
-                                       tool_calls: calls.isEmpty ? nil : calls))
+                if !item.text.isEmpty {
+                    blocks.append(["type": "text", "text": item.text])
+                }
+                for call in item.toolCalls {
+                    let input: Any = (try? JSONSerialization.jsonObject(with: Data(call.arguments.utf8), options: [])) ?? [:]
+                    blocks.append(["type": "tool_use", "id": call.id, "name": call.name, "input": input])
+                }
+                if !blocks.isEmpty {
+                    messages.append(["role": "assistant", "content": blocks])
+                }
             case .tool:
-                out.append(WireMessage(role: "tool",
-                                       content: item.text,
-                                       tool_call_id: item.toolCallId ?? ""))
+                let text = item.text.isEmpty ? "（没有输出）" : item.text
+                var block: [String: Any] = [
+                    "type": "tool_result",
+                    "tool_use_id": item.toolCallId ?? "",
+                    "content": [["type": "text", "text": text]],
+                ]
+                if item.isError { block["is_error"] = true }
+                pendingResults.append(block)
             }
         }
-        return out
+        flushResults()
+        return messages
     }
 
     private func systemPrompt() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd HH:mm zzz"
-        let now = formatter.string(from: Date())
+        """
+        你是运行在 iPad 上的 DeepSeek Harness 客户端里的助手。模型调用走 DeepSeek API，工具和文件都在本机执行。
 
-        return """
-        你是运行在 iPad 上的 DSH 助手。你身边没有电脑：模型调用、工具执行、文件都在这一台 iPad 上完成。
+        环境限制（不要假装能绕过）：
+        - 这是 iOS App，没有 shell、没有 git、没有编译器，不能 fork 进程。
+        - 所有文件操作只能在工作目录内，路径相对工作目录。
+        - 需要计算或脚本时用 run_js；需要取网页内容时用 fetch_url。
 
-        可用工具（都在 App 的沙盒工作目录里工作）：
-        - list_dir / read_file / write_file / make_dir / delete_path / move_path：读写工作目录里的文件
-        - fetch_url：抓取一个 http/https 网页的正文
-        - run_js：在 JavaScriptCore 里跑 JS，用 console.log 看输出（适合算数、处理文本）
-        - now：当前时间
+        可用工具：list_dir / read_file / write_file / make_dir / delete_path / move_path / fetch_url / run_js / now。
 
-        规则：
-        1. 没有 shell、没有 git、没有编译器和解释器命令行；需要算或处理文本就用 run_js，需要查资料就用 fetch_url。
-        2. 路径都相对工作目录，不要写绝对路径。
-        3. 多步任务直接动手用工具做，不要只给用户操作步骤。
-        4. 工具返回以「错误：」开头表示失败，先看清原因再换办法，别原样重试。
-        5. 回答用简洁中文，先说结果再说细节；不要吹牛，做不到就直说。
+        行为准则：
+        - 回答用中文，直接给结论和步骤，不要客套。
+        - 工具返回以「错误：」开头表示失败，不要当作正常结果继续编造。
+        - 长任务先给一句计划，再动手。
 
-        现在时间：\(now)
+        当前时间：\(nowString())
         """
     }
 
-    // MARK: - 错误描述
+    private func nowString() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss zzz"
+        formatter.locale = Locale(identifier: "zh_CN")
+        return formatter.string(from: Date())
+    }
 
     private func describe(_ error: Error) -> String {
         if backgroundedDuringRun {
             backgroundedDuringRun = false
-            return "任务中断：刚才 App 在后台被 iPadOS 挂起了，网络请求被切断。要继续请留在本 App 再发一条消息。"
+            return "任务中断：刚才 App 在后台被 iPadOS 挂起，网络连接被切断了。回来重发一次。"
         }
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .notConnectedToInternet: return "网络断了，检查一下 Wi-Fi。"
-            case .timedOut: return "请求超时。"
-            case .cancelled: return "请求被取消了。"
-            case .cannotFindHost, .dnsLookupFailed: return "找不到接口域名，检查接口地址。"
-            default: return "网络错误：\(urlError.localizedDescription)"
+        if let failure = error as? MessagesAPI.Failure { return failure.message }
+        if let failure = error as? LocalizedError, let text = failure.errorDescription { return text }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorNotConnectedToInternet: return "没有网络连接。"
+            case NSURLErrorTimedOut: return "请求超时，再试一次。"
+            case NSURLErrorCancelled: return "请求被取消。"
+            case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed: return "找不到服务器：\(baseURL)"
+            case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted: return "HTTPS 证书校验失败。"
+            default: break
             }
         }
-        if let failure = error as? ToolFailure, case .message(let text) = failure {
-            return text
-        }
-        return (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        return ns.localizedDescription
     }
 
     // MARK: - 后台宽限
 
     private func beginBackgroundGrace() {
-        guard backgroundTask == .invalid else { return }
+        endBackgroundGrace()
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "dsh-turn") { [weak self] in
-            Task { @MainActor in
-                self?.endBackgroundGrace()
-            }
+            Task { @MainActor in self?.endBackgroundGrace() }
         }
     }
 
@@ -471,8 +562,17 @@ final class AppModel: ObservableObject {
     // MARK: - 持久化
 
     private var storeURL: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("sessions.json")
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return docs.appendingPathComponent("sessions.json")
+    }
+
+    private func appendItem(_ item: ChatItem, to sessionID: UUID) {
+        mutate(sessionID) { session in
+            session.items.append(item)
+            if item.role == .user, session.title == "新会话" {
+                session.title = String(item.text.prefix(18))
+            }
+        }
     }
 
     private func mutate(_ sessionID: UUID, _ body: (inout ChatSession) -> Void) {
@@ -483,24 +583,34 @@ final class AppModel: ObservableObject {
     }
 
     private func loadSessions() {
-        if let data = try? Data(contentsOf: storeURL) {
-            if let decoded = try? JSONDecoder().decode([ChatSession].self, from: data), !decoded.isEmpty {
-                sessions = decoded
-                currentSessionID = decoded[0].id
-                return
-            }
-            // 解不开也不能直接覆盖掉：先留一份备份，下次 save() 才不会把历史抹掉。
-            let backup = storeURL.deletingPathExtension().appendingPathExtension("bak.json")
+        guard FileManager.default.fileExists(atPath: storeURL.path) else { return }
+        do {
+            let data = try Data(contentsOf: storeURL)
+            let decoded = try JSONDecoder().decode([ChatSession].self, from: data)
+            if decoded.isEmpty { return }
+            sessions = decoded
+            currentSessionID = decoded[0].id
+        } catch {
+            // 解码失败时先备份，避免下一次 save 把历史覆盖成空。
+            let backup = storeURL.deletingLastPathComponent().appendingPathComponent("sessions.bak.json")
             try? FileManager.default.removeItem(at: backup)
             try? FileManager.default.moveItem(at: storeURL, to: backup)
         }
-        let session = ChatSession()
-        sessions = [session]
-        currentSessionID = session.id
     }
 
     private func save() {
-        guard let data = try? JSONEncoder().encode(sessions) else { return }
-        try? data.write(to: storeURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(sessions)
+            try data.write(to: storeURL, options: .atomic)
+        } catch {
+            errorText = "会话历史保存失败：\(error.localizedDescription)"
+        }
     }
+}
+
+/// 把 SwiftUI 的 ScenePhase 隔在这里，AppModel 不需要 import SwiftUI。
+enum ScenePhaseValue {
+    case active
+    case inactive
+    case background
 }
