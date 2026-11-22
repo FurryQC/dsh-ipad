@@ -18,27 +18,28 @@ targets:
       - path: Shared
     dependencies:
       - target: DSHBroadcast
-    # 不用 XcodeGen 的 info: 块：它会重写 Info.plist，等于把 plist 复制成两份。
-    # 这里只通过 INFOPLIST_FILE 指向仓库里那份，保持单一来源。
+    # No info: block on purpose -- XcodeGen would rewrite Info.plist and keep a second copy.
+    # The repo plist is the single source, referenced through INFOPLIST_FILE.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc
         PRODUCT_NAME: DSH
-        # 版本名由用户指定（每轮交付前问一次）。b21 = 第 21 个构建。
-        MARKETING_VERSION: "b22"
-        CURRENT_PROJECT_VERSION: "22"
+        # Version name is chosen by the user for every delivery; build number matches it.
+        MARKETING_VERSION: "b23"
+        CURRENT_PROJECT_VERSION: "23"
         TARGETED_DEVICE_FAMILY: "2"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        # 引号是必要的：裸 NO 在 YAML 1.1 里是布尔 false，XcodeGen 会把值写成 false/0。
+        # Quotes matter: bare NO is a YAML 1.1 boolean and XcodeGen writes false/0.
         CODE_SIGNING_ALLOWED: "NO"
         ENABLE_BITCODE: "NO"
         SUPPORTS_MACCATALYST: "NO"
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: "NO"
         INFOPLIST_FILE: App/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
-        # App Group 供主 App 与广播扩展共享配置；用户重签时必须在签名工具里补上同一个组。
+        # App Group shared by the app and the broadcast extension; the re-signing tool
+        # must add the same group to both bundle ids.
         CODE_SIGN_ENTITLEMENTS: App/DSH.entitlements
 
   DSHBroadcast:
@@ -54,8 +55,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dsh.qc.broadcast
         PRODUCT_NAME: DSHBroadcast
-        MARKETING_VERSION: "b22"
-        CURRENT_PROJECT_VERSION: "22"
+        MARKETING_VERSION: "b23"
+        CURRENT_PROJECT_VERSION: "23"
         SWIFT_VERSION: "5.0"
         IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         INFOPLIST_FILE: BroadcastExtension/Info.plist

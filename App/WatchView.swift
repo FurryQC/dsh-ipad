@@ -12,6 +12,7 @@ struct WatchView: View {
     @State private var config = WatchShared.load()
     @State private var lastResult: String = ""
     @State private var lastAt: Date?
+    @State private var diag = WatchShared.readDiag()
     @State private var status: String = ""
     @State private var savedHint = false
 
@@ -24,6 +25,7 @@ struct WatchView: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         statusCard
+                        diagnosticCard
                         startCard
                         configCard
                         saveRow
@@ -44,8 +46,12 @@ struct WatchView: View {
                 config = WatchShared.load()
                 requestNotificationPermission()
                 refreshLastResult()
+                diag = WatchShared.readDiag()
             }
-            .onReceive(timer) { _ in refreshLastResult() }
+            .onReceive(timer) { _ in
+                refreshLastResult()
+                diag = WatchShared.readDiag()
+            }
         }
     }
 
@@ -77,6 +83,72 @@ struct WatchView: View {
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(panel)
+    }
+
+    /// 广播「开启了但什么都没发生」时，靠这一张卡定位卡在哪一步。
+    private var diagnosticCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "stethoscope")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Theme.accent)
+                Text("诊断")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(Theme.textSecondary)
+                Spacer()
+                Button {
+                    diag = WatchShared.readDiag()
+                } label: {
+                    Text("刷新")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.accent)
+                }
+            }
+            Divider().overlay(Theme.stroke)
+            diagRow("App Group", WatchShared.groupAvailable ? "可用" : "不可用（重签没加 group.com.dsh.qc）",
+                    good: WatchShared.groupAvailable)
+            diagRow("配置", diag.configEnabled ? "已启用" : "未启用 / 没读到", good: diag.configEnabled)
+            diagRow("扩展心跳", heartbeatText, good: heartbeatFresh)
+            diagRow("收到帧", "\(diag.frames)", good: diag.frames > 0)
+            diagRow("已发送识别", "\(diag.sent)", good: diag.sent > 0)
+            if !diag.lastError.isEmpty {
+                Text(diag.lastError)
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("读法：帧数是 0 → 广播没真正跑起来或扩展没拿到画面；帧数在涨但发送是 0 → 配置读不到（App Group）；发送在涨但没通知 → 通知权限。")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(panel)
+    }
+
+    private var heartbeatFresh: Bool {
+        diag.heartbeat > 0 && Date().timeIntervalSince1970 - diag.heartbeat < 15
+    }
+
+    private var heartbeatText: String {
+        guard diag.heartbeat > 0 else { return "还没有（扩展没写过状态）" }
+        let at = Date(timeIntervalSince1970: diag.heartbeat)
+        return relative(at)
+    }
+
+    private func diagRow(_ title: String, _ value: String, good: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(title)
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textTertiary)
+                .frame(width: 86, alignment: .leading)
+            Text(value)
+                .font(.system(size: 12))
+                .foregroundColor(good ? Theme.success : Theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
     }
 
     private var startCard: some View {

@@ -51,6 +51,47 @@ enum WatchShared {
         let stamp = defaults.double(forKey: lastResultAtKey)
         return (text, stamp > 0 ? Date(timeIntervalSince1970: stamp) : nil)
     }
+
+    static let diagKey = "watch.diag"
+
+    /// 扩展的运行状态：主 App 读它来判断到底卡在哪一步（没起来 / 读不到配置 / 请求失败）。
+    struct Diag: Codable {
+        /// 扩展最近一次写入心跳的 Unix 秒。
+        var heartbeat: Double = 0
+        /// 收到的视频帧数。
+        var frames: Int = 0
+        /// 真正发出去识别的次数。
+        var sent: Int = 0
+        /// 扩展自己判断的 App Group 可用性。
+        var groupOK = false
+        /// 读到的配置里 enabled 是否为 true。
+        var configEnabled = false
+        var lastError = ""
+    }
+
+    /// App Group 是否可用。重签时没给两个 target 都加 entitlements，这里就是 false。
+    static var groupAvailable: Bool { UserDefaults(suiteName: suiteName) != nil }
+
+    static func readDiag() -> Diag {
+        guard let data = defaults.data(forKey: diagKey),
+              let diag = try? JSONDecoder().decode(Diag.self, from: data) else {
+            return Diag()
+        }
+        return diag
+    }
+
+    static func updateDiag(_ mutate: (inout Diag) -> Void) {
+        var diag = readDiag()
+        mutate(&diag)
+        diag.heartbeat = Date().timeIntervalSince1970
+        if let data = try? JSONEncoder().encode(diag) {
+            defaults.set(data, forKey: diagKey)
+        }
+    }
+
+    static func clearDiag() {
+        defaults.removeObject(forKey: diagKey)
+    }
 }
 
 /// 截帧识别用的最小 Messages API 客户端（扩展现程里跑，不依赖主 App 的 MessagesAPI）。
